@@ -1,28 +1,46 @@
 #!/usr/bin/env bash
 #
-# vibenerabilities/run.sh — incremental, commit-by-commit security-analysis pipeline (portable).
+# vibenerabilities/run.sh — incremental, commit-by-commit security-analysis pipeline.
 #
 # STATEFUL REPLAY: for each project commit (oldest -> newest), check it out into a
-# disposable git worktree and invoke `opencode run --command vuln-commit` headlessly. The
-# agent gets a FRESH, SMALL context per commit, runs three detection passes (introduced /
-# fixed / late-discovered), and updates the vulnerability records under
-# agent/project/vulnerabilities/.
+# disposable git worktree and invoke the built-in `vuln-agent` CLI headlessly
+# (python3 -m vuln_agent — stdlib-only, speaks any OpenAI-compatible API). The
+# agent gets a FRESH, SMALL context per commit, runs three detection passes
+# (introduced / fixed / late-discovered) and updates the vulnerability records
+# under agent/project/.
 #
-# Unlike the documentation pipeline, EVERY commit is analyzed — there is no skip regex by
-# default, because a `fix:`/`chore:` commit may be a security fix and the only signal of a
-# previously-missed issue.
+# Unlike a documentation pipeline, EVERY commit is analyzed: there is no skip
+# filter by default — `fix:`, `chore:`, `refactor:` commits may be the ONLY
+# signal of a security fix and must be inspected against the actual diff.
 #
 # The outer loop lives HERE (in bash), outside every agent call — by design.
 #
-# Restart-after-sync: the last fully-analyzed project commit is stored (committed) in
+# Restart-after-sync: the last fully-processed project commit is stored (committed) in
 # agent/project/.vibenerabilities.json. After you pull new changes into the project,
-# re-running analyzes only baseline..HEAD.
+# re-running analyzes only baseline..HEAD. A FAILED commit rolls the baseline back to
+# its parent and is requeued automatically (progress.json failures[]), so LLM outages
+# and timeouts never silently skip a commit.
 #
-# Auto-commit: when the agent changes records, this script commits them to the workspace
-# git repo (the project folder and this tooling folder are gitignored). One commit per
-# analyzed project commit that produced findings, plus a trailing baseline commit if needed.
+# Fresh-workspace reruns: --reuse-verdicts <dir> replays NO_VULN verdicts from a
+# previous run's verdicts/ folder (--skip-list <file> lists SHAs by hand), so commits
+# already found clean cost no agent calls. With --record-hints, commits the prior run
+# flagged (VULN_UPDATED) get a reconsideration round: a NO_VULN finish is held back
+# while the prior run's actual record content is fed back to the agent for one
+# re-examination.
 #
-# Requires: git, jq, opencode. (optional: timeout)
+# SNAPSHOT DEEP-SCAN (--snapshot [REF]): for histories of thousands+ commits, skip
+# the replay entirely - one planner request partitions the tree at REF (default HEAD)
+# into modules, one agent session per module deep-scans it for pre-existing
+# vulnerabilities, the baseline jumps to REF, and subsequent regular runs analyze
+# only NEW commits. Interrupted snapshots resume: finished modules are skipped.
+#
+# Auto-commit: when the agent changes records, this script commits them to the
+# workspace git repo (the project folder and this tooling folder are gitignored).
+# One commit per analyzed project commit, plus a trailing baseline commit if needed.
+#
+# Requires: git, jq, python3 (>=3.8), an OpenAI-compatible LLM endpoint configured in
+# config.json (llm section) or via env (VULN_MODEL, VULN_BASE_URL, VULN_API_KEY).
+# (optional: timeout)
 #
 set -euo pipefail
 
@@ -30,20 +48,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE_DIR="$SCRIPT_DIR"
 WORK_DIR="$(cd "$PIPELINE_DIR/.." && pwd)"
 CONFIG="$PIPELINE_DIR/config.json"
+RECORDS_ROOT_REL="agent/project"
 RECORDS_ROOT="$WORK_DIR/agent/project"
-SYNC="$RECORDS_ROOT/.vibenerabilities.json"   # COMMITTED — source of truth for baseline
-PROGRESS="$PIPELINE_DIR/progress.json"        # gitignored — processed[]/counters (fast resume)
+SYNC="$RECORDS_ROOT/.vibenerabilities.json"    # COMMITTED — source of truth for baseline
+PROGRESS="$PIPELINE_DIR/progress.json"         # gitignored — processed[]/counters (fast resume)
 WALK_LOG="$PIPELINE_DIR/walk.log"
 VERDICTS="$PIPELINE_DIR/verdicts"
 RUN_LOGS="$PIPELINE_DIR/logs"
 TREES="$WORK_DIR/.vibe-trees"
 
+# make `python3 -m vuln_agent` importable regardless of the caller's cwd
+export PYTHONPATH="$PIPELINE_DIR${PYTHONPATH:+:$PYTHONPATH}"
+
 declare -A SUBJ SHORT PROC
-CUR_TREE=""; SERVE_PID=""; SERVE_LOG=""
+declare -A CACHED_SKIP   # sha -> source <sha>.txt (abs path) | "list" — preseeded NO_VULN
+declare -A PRIOR_REC     # sha -> 1 — prior run flagged it (VULN_UPDATED verdict)
+PRESEEDED_N=0; PRIOR_REC_N=0   # scalars: ${#empty_assoc[@]} trips set -u on bash 5.2
+CUR_TREE=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
-need git; need jq; need opencode
+need git; need jq; need python3
 
 jstr() { local v; v="$(jq -r "$1" "$CONFIG")"; [ "$v" = "null" ] && v=""; printf '%s' "$v"; }
 jbool() { jq -e "$1 // false" "$CONFIG" >/dev/null 2>&1 && echo true || echo false; }
@@ -57,13 +82,16 @@ PROJECT="$(jstr '.project')";        PROJECT="${PROJECT:-project}"; PROJECT="$(s
 SOURCE_REL="$(jstr '.source_root')"; SOURCE_REL="${SOURCE_REL:-.}"
 if [[ "$SOURCE_REL" == /* ]]; then SOURCE_DIR="$SOURCE_REL"; else SOURCE_DIR="$WORK_DIR/$SOURCE_REL"; fi
 BRANCH="$(jstr '.source_branch')";   BRANCH="${BRANCH:-main}"
+# Ships EMPTY by design: the security pipeline does NOT skip commits on message
+# prefixes. Set it only deliberately (e.g. a docs-only subtree), and even then
+# run.sh force-skips ONLY commits that rename/move/delete nothing (path hygiene).
 SKIP_REGEX="$(jstr '.commit_skip_regex')"
-CMD_NAME="$(jstr '.commit_command')"; CMD_NAME="${CMD_NAME:-vuln-commit}"
+SCOPE="$(jstr '.scope')"
+CFG_MODEL="$(jstr '.llm.model')"
+RECORDS_ROOT_REL="$(jstr '.records_root')"; RECORDS_ROOT_REL="${RECORDS_ROOT_REL:-agent/project}"
+RECORDS_ROOT="$WORK_DIR/$RECORDS_ROOT_REL"
 USE_WORKTREE="$(jbool '.use_worktree')"
 SKIP_MERGES="$(jbool '.skip_merges')"
-CFG_MODEL="$(jstr '.model')"
-CFG_AGENT="$(jstr '.agent')"
-AUTO="$(jbool '.auto')"
 RUN_TIMEOUT="$(jstr '.run_timeout_seconds')"; RUN_TIMEOUT="${RUN_TIMEOUT:-0}"
 AUTO_COMMIT="$(jbool '.auto_commit')"
 GIT_NAME="$(jstr '.git_author_name')";   GIT_NAME="${GIT_NAME:-vibenerabilities}"
@@ -80,23 +108,22 @@ ensure_git_repo() {
 }
 ensure_git_repo
 
-# ---- install command + skill into .opencode/ from canonical copies ----
-install_into_opencode() {
-  local src="$PIPELINE_DIR/opencode"
-  mkdir -p "$WORK_DIR/.opencode/command" "$WORK_DIR/.opencode/skills"
-  [ -d "$src/command" ] && cp -f "$src"/command/* "$WORK_DIR/.opencode/command/" 2>/dev/null || true
-  [ -d "$src/skills" ] && cp -rf "$src"/skills/* "$WORK_DIR/.opencode/skills/" 2>/dev/null || true
-}
-
 # ---- committed sync state (.vibenerabilities.json) ----
 init_sync() {
   [ -f "$SYNC" ] || cat > "$SYNC" <<JSON
 {"project":"$PROJECT","source_root":"$SOURCE_REL","branch":"$BRANCH","baseline":"","analyzed_commits":0,"last_synced":null}
 JSON
 }
-sync_set_baseline() { # <sha>
+sync_set_baseline() { # <sha> ("" = no baseline / rolled back before the root)
   jq --arg b "$1" --arg t "$(date -Iseconds)" \
     '.baseline=$b | .last_synced=$t' "$SYNC" > "$SYNC.tmp" && mv "$SYNC.tmp" "$SYNC"
+  # keep INDEX.md's Sync Status truthful (deterministic, not LLM-maintained).
+  # NB: "${SUBJ[$1]:-}" with an EMPTY $1 is a fatal expansion error ("bad array
+  # subscript") under set -u — || true cannot catch it — hence the explicit guard.
+  local label=""
+  if [ -n "$1" ]; then label="${SUBJ[$1]:-}"; fi
+  python3 -m vuln_agent.hub --records-root "$RECORDS_ROOT" --baseline "$1" \
+    --label "$label" --date "$(date +%F)" >/dev/null 2>&1 || true
 }
 
 # ---- gitignored progress (processed[]/counters) ----
@@ -109,18 +136,89 @@ load_processed() {
   PROC=()
   while IFS= read -r s; do [ -n "$s" ] && PROC["$s"]=1; done < <(jq -r '.processed[]?' "$PROGRESS")
 }
+requeue_failed() { # print full SHAs of commits recorded as failed on a previous run
+  local s f
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    f="$(g rev-parse --verify --quiet "$s^{commit}" 2>/dev/null || true)"
+    [ -n "$f" ] && printf '%s\n' "$f"
+  done < <(jq -r '.failures[]?' "$PROGRESS" 2>/dev/null)
+}
+
+# ---- preseeded clean-commit knowledge (fresh-workspace reruns) ----
+# A NO_VULN verdict is a pure function of the commit (diff + tree), so verdicts
+# from a previous run of the same project can be replayed for free — no agent
+# call is spent re-deciding them. VULN_UPDATED verdicts canNOT be reused: the
+# records map is rebuilt from scratch, so those commits must be re-analyzed
+# (with --record-hints they get a reconsideration round instead).
+load_known_skips() {
+  local f full line n=0
+  if [ -n "$REUSE_VERDICTS" ]; then
+    [ -d "$REUSE_VERDICTS" ] || die "--reuse-verdicts: not a directory: $REUSE_VERDICTS"
+    REUSE_VERDICTS="$(cd "$REUSE_VERDICTS" && pwd)"
+    for f in "$REUSE_VERDICTS"/*.txt; do
+      [ -f "$f" ] || continue
+      case "$(head -1 "$f" 2>/dev/null || true)" in
+        VERDICT:\ NO_VULN*) ;;
+        *) continue;;
+      esac
+      full="$(g rev-parse --verify --quiet "$(basename "${f%.txt}")^{commit}" 2>/dev/null || true)"
+      [ -n "$full" ] || continue   # not a commit of this project: ignore
+      CACHED_SKIP["$full"]="$f"; n=$((n+1))
+    done
+    PRESEEDED_N=$((PRESEEDED_N + n))
+    echo "reuse-verdicts: $n reusable NO_VULN verdict(s) from $REUSE_VERDICTS"
+  fi
+  if [ -n "$SKIP_LIST" ]; then
+    [ -f "$SKIP_LIST" ] || die "--skip-list: not a file: $SKIP_LIST"
+    n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line//[[:space:]]/}"
+      case "$line" in ""|\#*) continue;; esac
+      full="$(g rev-parse --verify --quiet "$line^{commit}" 2>/dev/null || true)"
+      if [ -z "$full" ]; then echo "warn: skip-list: unknown commit '$line' ignored" >&2; continue; fi
+      [[ -v CACHED_SKIP["$full"] ]] && continue
+      CACHED_SKIP["$full"]="list"; n=$((n+1))
+    done < "$SKIP_LIST"
+    PRESEEDED_N=$((PRESEEDED_N + n))
+    echo "skip-list: $n commit(s) preseeded as clean (NO_VULN)"
+  fi
+  if [ "$RECORD_HINTS" = 1 ]; then
+    [ -n "$REUSE_VERDICTS" ] || die "--record-hints requires --reuse-verdicts DIR (the prior run's verdicts folder)"
+    # commits the prior run flagged: eligible for a reconsideration round
+    # when the current run's agent says NO_VULN (--record-hints)
+    local j n=0
+    for j in "$REUSE_VERDICTS"/*.json; do
+      [ -f "$j" ] || continue
+      [ "$(jq -r 'if .verdict == "VULN_UPDATED" then .verdict else empty end' "$j" 2>/dev/null)" = "VULN_UPDATED" ] || continue
+      full="$(g rev-parse --verify --quiet "$(basename "${j%.json}")^{commit}" 2>/dev/null || true)"
+      [ -n "$full" ] || continue
+      PRIOR_REC["$full"]=1; n=$((n+1))
+    done
+    PRIOR_REC_N=$n
+    # the prior run's records map lives in the workspace the verdicts came from:
+    # <workspace>/<pipeline>/verdicts -> <workspace>/<records_root>
+    PRIOR_PIPELINE="$(cd "$REUSE_VERDICTS/.." && pwd)"
+    PRIOR_WORK="$(cd "$PRIOR_PIPELINE/.." && pwd)"
+    PRIOR_RECORDS_REL="$(jq -r '.records_root // empty' "$PRIOR_PIPELINE/config.json" 2>/dev/null || true)"
+    PRIOR_RECORDS_REL="${PRIOR_RECORDS_REL:-agent/project}"
+    if [[ "$PRIOR_RECORDS_REL" == /* ]]; then PRIOR_RECORDS="$PRIOR_RECORDS_REL"; else PRIOR_RECORDS="$PRIOR_WORK/$PRIOR_RECORDS_REL"; fi
+    [ -d "$PRIOR_RECORDS" ] || die "--record-hints: prior records map not found at $PRIOR_RECORDS (derived from the verdicts dir: keep the prior workspace intact)"
+    echo "record-hints: $n prior VULN_UPDATED commit(s) reconsiderable; prior records at $PRIOR_RECORDS"
+  fi
+}
 
 # ---- auto-commit helpers ----
 commit_records() { # <short> <subject>
   [ "$AUTO_COMMIT" = true ] || return 0
-  gitw add agent/project
+  gitw add "$RECORDS_ROOT"
   gitw diff --cached --quiet >/dev/null 2>&1 && return 0
   local msg; msg="$(sanitize "$2")"
   gitw commit -q -m "vulns(${PROJECT}): ${msg}" -m "project commit ${1}" || echo "(commit skipped: nothing staged)"
 }
 commit_baseline_if_dirty() { # <short>
   [ "$AUTO_COMMIT" = true ] || return 0
-  gitw add "$SYNC" 2>/dev/null || gitw add agent/project/.vibenerabilities.json 2>/dev/null || true
+  gitw add "$SYNC" "$RECORDS_ROOT/INDEX.md" 2>/dev/null || true
   gitw diff --cached --quiet >/dev/null 2>&1 && return 0
   gitw commit -q -m "vulns(${PROJECT}): baseline @${1}" || true
 }
@@ -143,11 +241,14 @@ load_meta() { # <sha...>
 
 # ---- worktree lifecycle ----
 make_tree() { # <sha>
-  local sha="$1" path
+  local sha="$1" path out
   [ -n "${SHORT[$sha]:-}" ] || die "no short sha loaded for $sha (call load_meta first)"
   if [ "$USE_WORKTREE" = true ]; then
     path="$TREES/${SHORT[$sha]}"; rm -rf "$path"
-    g worktree add --detach "$path" "$sha" >/dev/null 2>&1 || die "worktree add failed for ${SHORT[$sha]}"
+    # clear dangling registrations from crashed runs: a stale .git/worktrees entry
+    # for a now-deleted path makes `worktree add` refuse the path
+    g worktree prune 2>/dev/null || true
+    out="$(g worktree add --detach "$path" "$sha" 2>&1 >/dev/null)" || die "worktree add failed for ${SHORT[$sha]}: $out"
     echo "$path"
   else
     [ -z "$(g status --porcelain)" ] || die "in-place mode needs a clean source clone; commit/stash first"
@@ -159,24 +260,65 @@ free_tree() { # <path>
   local path="$1"
   [ "$USE_WORKTREE" = true ] || { g checkout -q "$BRANCH" 2>/dev/null || true; return 0; }
   [ "$path" != "$SOURCE_DIR" ] || return 0
-  g worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+  if ! g worktree remove --force "$path" 2>/dev/null; then
+    # plain rm -rf leaves a dangling .git/worktrees registration that breaks the
+    # next `worktree add` for this path — always prune after the fallback
+    rm -rf "$path"; g worktree prune 2>/dev/null || true
+  fi
 }
 
-# ---- cleanup on exit / interrupt: free any in-flight worktree, prune, stop serve ----
+# ---- cleanup on exit / interrupt: free any in-flight worktree, prune ----
 cleanup() {
   if [ -n "${CUR_TREE:-}" ]; then free_tree "$CUR_TREE" 2>/dev/null || true; CUR_TREE=""; fi
   [ -n "${SOURCE_DIR:-}" ] && git -C "$SOURCE_DIR" worktree prune 2>/dev/null || true
-  if [ -n "${SERVE_PID:-}" ]; then kill "$SERVE_PID" 2>/dev/null || true; fi
-  [ -n "${SERVE_LOG:-}" ] && [ -f "$SERVE_LOG" ] && rm -f "$SERVE_LOG" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
+# ---- commit_skip_regex gate ----
+# Ships EMPTY (see config): every commit is analyzed by design. When a user sets
+# a regex anyway, a matching subject is force-skipped ONLY when the commit
+# renames/moves/deletes nothing: an R/D commit may carry paths that existing
+# records cite (path hygiene) and must still reach the agent.
+# grep -c reads the WHOLE diff (no -q early exit): under `set -o pipefail`
+# grep -q can exit on the first hit while git is still writing, git dies with
+# SIGPIPE (141), the pipeline status flips, and `!` would wrongly ALLOW the
+# skip for a rename/delete commit - a race that leaks stale cited paths.
+has_rd_changes() { # <sha> -> rc 0 when the commit renames/moves/deletes anything
+  local n
+  n="$(g diff --name-status -M "$1^" "$1" | grep -cE '^[RD]')" || n=0
+  [ "$n" -gt 0 ]
+}
+regex_skips() { # <sha> <subject>
+  [ -n "$SKIP_REGEX" ] || return 1
+  [[ "$2" =~ $SKIP_REGEX ]] || return 1
+  g rev-parse --verify --quiet "$1^" >/dev/null 2>&1 || return 0  # root commit: no R/D
+  ! has_rd_changes "$1"
+}
+
 # ---- run one commit ----
 run_one() { # <sha>
-  local sha="$1" short subject path verdict rc kind extra=""
+  local sha="$1" short subject path args verdict rc kind parent=""
   short="${SHORT[$sha]}"; subject="${SUBJ[$sha]}"
 
-  if [ -n "$SKIP_REGEX" ] && [[ $subject =~ $SKIP_REGEX ]]; then
+  if [[ -v CACHED_SKIP["$sha"] ]]; then
+    # preseeded NO_VULN (from --reuse-verdicts or --skip-list): replay it, no agent call
+    local src="${CACHED_SKIP[$sha]}"
+    echo "[$short] CLEAN (preseeded)  $subject"
+    if [[ "$src" != list ]]; then
+      # copy the old verdict artifacts for traceability (skip if same verdicts dir)
+      if [ "$(cd "$(dirname "$src")" && pwd)" != "$VERDICTS" ]; then
+        cp -f "$src" "$VERDICTS/$sha.txt"
+        [ -f "${src%.txt}.json" ] && cp -f "${src%.txt}.json" "$VERDICTS/$sha.json"
+      fi
+    else
+      printf 'VERDICT: NO_VULN(skip-list)\n' > "$VERDICTS/$sha.txt"
+    fi
+    sync_set_baseline "$sha"
+    save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1'
+    return 0
+  fi
+
+  if regex_skips "$sha" "$subject"; then
     echo "[$short] SKIP (regex)  $subject"
     printf 'VERDICT: NO_VULN(regex)\n' > "$VERDICTS/$sha.txt"
     sync_set_baseline "$sha"
@@ -186,22 +328,27 @@ run_one() { # <sha>
 
   path="$(make_tree "$sha")"
   CUR_TREE="$path"
-  [ "${CLASSIFY_ONLY:-0}" = 1 ] && extra="classify-only"
 
-  local oc=(run --command "$CMD_NAME")
-  [ "$AUTO" = true ] && oc+=(--auto)
-  local model="${OVERRIDE_MODEL:-$CFG_MODEL}"; [ -n "$model" ] && oc+=(--model "$model")
-  [ -n "$CFG_AGENT" ] && oc+=(--agent "$CFG_AGENT")
-  [ -n "$ATTACH" ] && oc+=(--attach "$ATTACH")
-  oc+=("$sha" "$path" "$VERDICTS/$sha.txt")
-  [ -n "$extra" ] && oc+=("$extra")
+  local ag=(python3 -m vuln_agent --config "$CONFIG" --sha "$sha" --worktree "$path"
+            --records-root "$RECORDS_ROOT" --records-root-rel "$RECORDS_ROOT_REL"
+            --verdicts-dir "$VERDICTS")
+  [ "${CLASSIFY_ONLY:-0}" = 1 ] && ag+=(--classify-only)
+  if [ "$RECORD_HINTS" = 1 ] && [[ -v PRIOR_REC["$sha"] ]]; then
+    # prior run flagged this commit: enable the NO_VULN reconsideration round
+    ag+=(--prior-verdict "$REUSE_VERDICTS/$sha.json" --prior-records "$PRIOR_RECORDS")
+  fi
+  local model="${OVERRIDE_MODEL:-$CFG_MODEL}"; [ -n "$model" ] && ag+=(--model "$model")
 
   echo "[$short] ANALYZE       $subject"
+  # clear artifacts from any previous attempt of this sha: a crashed agent that
+  # wrote nothing must never inherit a stale verdict file (it would be parsed
+  # as this run's decision below)
+  rm -f "$VERDICTS/$sha.txt" "$VERDICTS/$sha.json"
   rc=0
   if [ -n "$RUN_TIMEOUT" ] && [ "$RUN_TIMEOUT" != 0 ] && command -v timeout >/dev/null 2>&1; then
-    timeout "${RUN_TIMEOUT}s" opencode "${oc[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
+    timeout "${RUN_TIMEOUT}s" "${ag[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
   else
-    opencode "${oc[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
+    "${ag[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
   fi
   free_tree "$path"
   CUR_TREE=""
@@ -209,7 +356,7 @@ run_one() { # <sha>
   verdict="$(head -1 "$VERDICTS/$sha.txt" 2>/dev/null || true)"
   case "$verdict" in
     VERDICT:\ VULN_UPDATED*) kind=updated;;
-    VERDICT:\ NO_VULN*)      kind=skipped;;
+    VERDICT:\ NO_VULN*)      kind=clean;;
     *)                       kind=failed; verdict="${verdict:-NO_VERDICT(rc=$rc)}";;
   esac
 
@@ -218,11 +365,24 @@ run_one() { # <sha>
     die "stopping at $short"
   fi
 
-  sync_set_baseline "$sha"
+  if [ "${CLASSIFY_ONLY:-0}" = 1 ]; then
+    # dry-run decides but never mutates durable state: no baseline advance, no
+    # progress marks, no commits — a later real run re-processes everything
+    echo "[$short] -> would-$kind ($verdict)  [dry-run]"
+    return 0
+  fi
+
   case "$kind" in
-    updated) save_progress --arg b "$sha" '.processed += [$b] | .updated += 1'; commit_records "$short" "$subject";;
-    skipped) save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1';;
-    *)       save_progress --arg b "$sha" --arg f "$short" '.processed += [$b] | .failed += 1 | .failures += [$f]';;
+    updated) sync_set_baseline "$sha"
+             save_progress --arg b "$sha" '.processed += [$b] | .updated += 1'; commit_records "$short" "$subject";;
+    clean)   sync_set_baseline "$sha"
+             save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1';;
+    *)       # failure is NOT "processed": roll the baseline back to the parent so
+             # the next run's rev-list range includes this commit again
+             parent="$(g rev-parse --verify --quiet "$sha^" 2>/dev/null || true)"
+             sync_set_baseline "${parent:-}"
+             save_progress --arg b "$sha" --arg f "$short" '.processed += [$b] | .failed += 1 | .failures += [$f]'
+             echo "[$short]    analyze: logs/$sha.log  $( [ -f "$VERDICTS/$sha.transcript.jsonl" ] && echo "verdicts/$sha.transcript.jsonl (python3 -m vuln_agent.transcript <file>)" )";;
   esac
   echo "[$short] -> $kind ($verdict)"
 }
@@ -232,48 +392,75 @@ read -r -d '' USAGE <<'EOF' || true
 Usage: run.sh [options]
 
   (no args)       Run the walk from the committed baseline up to project HEAD.
-  --setup         (re)install command+skill into .opencode/ and exit.
-  --list          Show commit list + PROCESS/DONE decisions, then exit (no agent calls).
-  --dry-run       Invoke the agent in classify-only mode (no record writes, no commits).
+  --snapshot [R]  Deep-scan the CURRENT tree at commit R (default HEAD) for
+                  pre-existing vulnerabilities instead of replaying history:
+                  a planner request partitions the tree into modules, then one
+                  agent session per module scans it. Sets the baseline to R -
+                  later runs analyze only newer commits. Interrupted snapshots
+                  resume (finished modules are skipped).
+  --list          Show commit list + ANALYZE/SKIP/DONE decisions, then exit (no agent calls).
+  --dry-run       Invoke the agent in classify-only mode (no record writes, no
+                  baseline advance, no commits — a later real run re-processes).
+  --validate [S]  Validate existing records against the tree at commit S (default HEAD):
+                  links, numbering, layout, source paths, stale references. No agent.
   --reset-baseline  Reset the committed baseline to the project's first commit and exit.
   --limit N       Process at most N commits this run.
   --range X       Process commits in range X (e.g. A..B). Overrides baseline.
   --sha S         Process a single commit (ignores baseline).
+  --reuse-verdicts DIR
+                  Replay NO_VULN verdicts from a previous run's verdicts
+                  directory: those commits are marked clean without any agent
+                  calls (useful when re-running the same project from scratch).
+                  VULN_UPDATED verdicts are not reused — the records map is
+                  rebuilt from scratch.
+  --skip-list FILE
+                  Additionally treat the commits listed in FILE (one hash per
+                  line, '#' comments, short or full SHAs) as NO_VULN without
+                  agent calls.
+  --record-hints  Requires --reuse-verdicts. When the agent finishes NO_VULN
+                  for a commit the prior run flagged (VULN_UPDATED), feed the
+                  prior run's actual record CONTENT back into the same session
+                  and ask for one reconsideration round before accepting
+                  NO_VULN. Helps borderline findings converge across reruns
+                  instead of flip-flopping with sampling noise.
   --in-place      Checkout each commit in the source clone instead of a worktree.
-  --stop-on-fail  Halt on the first failed commit (default: record and continue).
+  --stop-on-fail  Halt on the first failed commit (default: record, roll the
+                  baseline back to the parent and continue; failed commits are
+                  requeued automatically on the next run).
   --no-commit     Do not git-commit record changes this run (overrides config auto_commit).
-  --attach U      Attach each run to a running 'opencode serve' at URL U.
-  --model M       Override the model for this run.
-  --serve         Start 'opencode serve' in the background for the run, then stop it.
+  --model M       Override the model for this run (or export VULN_MODEL).
   --help          Show this help.
 EOF
 
-DO_LIST=0; RESET_BASE=0; DO_SETUP=0; LIMIT=0; RANGE=""; SINGLE=""; ATTACH=""; OVERRIDE_MODEL=""
-STOP_ON_FAIL=0; CLASSIFY_ONLY=0; SERVE=0
+DO_LIST=0; RESET_BASE=0; LIMIT=0; RANGE=""; SINGLE=""; OVERRIDE_MODEL=""
+STOP_ON_FAIL=0; CLASSIFY_ONLY=0; VALIDATE=0; VALIDATE_REF=""
+REUSE_VERDICTS=""; SKIP_LIST=""; RECORD_HINTS=0
+SNAPSHOT=0; SNAPSHOT_REF=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --setup) DO_SETUP=1;;
     --list) DO_LIST=1;;
     --dry-run) CLASSIFY_ONLY=1;;
+    --validate) VALIDATE=1
+                 if [ $# -ge 2 ] && [[ "$2" != -* ]]; then VALIDATE_REF="$2"; shift; fi;;
     --reset-baseline) RESET_BASE=1;;
+    --snapshot) SNAPSHOT=1
+                 if [ $# -ge 2 ] && [[ "$2" != -* ]]; then SNAPSHOT_REF="$2"; shift; fi;;
     --limit) LIMIT="${2:?--limit needs N}"; shift;;
     --range) RANGE="${2:?--range needs A..B}"; shift;;
     --sha) SINGLE="${2:?--sha needs SHA}"; shift;;
+    --reuse-verdicts) REUSE_VERDICTS="${2:?--reuse-verdicts needs DIR}"; shift;;
+    --skip-list) SKIP_LIST="${2:?--skip-list needs FILE}"; shift;;
+    --record-hints) RECORD_HINTS=1;;
     --in-place) USE_WORKTREE=false;;
     --stop-on-fail) STOP_ON_FAIL=1;;
     --no-commit) AUTO_COMMIT=false;;
-    --attach) ATTACH="${2:?--attach needs URL}"; shift;;
     --model) OVERRIDE_MODEL="${2:?--model needs M}"; shift;;
-    --serve) SERVE=1;;
     --help|-h) echo "$USAGE"; exit 0;;
     *) die "unknown arg: $1";;
   esac
   shift
 done
-export USE_WORKTREE STOP_ON_FAIL CLASSIFY_ONLY ATTACH OVERRIDE_MODEL
-
-install_into_opencode
-[ "$DO_SETUP" = 1 ] && { echo "Installed command + skill into .opencode/"; exit 0; }
+export USE_WORKTREE STOP_ON_FAIL CLASSIFY_ONLY OVERRIDE_MODEL
 
 init_sync; init_progress
 
@@ -281,56 +468,142 @@ init_sync; init_progress
 
 [ -d "$SOURCE_DIR/.git" ] || die "source_root '$SOURCE_DIR' is not a git repository (set source_root in config.json)"
 
+# ---- snapshot deep-scan mode: scan the CURRENT tree, skip history ----
+if [ "$SNAPSHOT" = 1 ]; then
+  if [ "$DO_LIST" != 0 ] || [ "$RESET_BASE" != 0 ] || [ "$VALIDATE" != 0 ] \
+     || [ "$CLASSIFY_ONLY" != 0 ] || [ -n "$SINGLE" ] || [ -n "$RANGE" ] \
+     || [ "$LIMIT" != 0 ] || [ -n "$REUSE_VERDICTS" ] || [ -n "$SKIP_LIST" ] \
+     || [ "$RECORD_HINTS" != 0 ]; then
+    die "--snapshot cannot be combined with --list/--dry-run/--validate/--reset-baseline/--sha/--range/--limit/--reuse-verdicts/--skip-list/--record-hints"
+  fi
+  [ -n "${OVERRIDE_MODEL:-}" ] || [ -n "$CFG_MODEL" ] || [ -n "${VULN_MODEL:-}" ] || \
+    die "no model configured: set llm.model in config.json or export VULN_MODEL"
+  REF="${SNAPSHOT_REF:-HEAD}"
+  FULL="$(g rev-parse --verify --quiet "$REF^{commit}" || true)"
+  [ -n "$FULL" ] || die "commit not found for --snapshot: $REF"
+  load_meta "$FULL"
+  path="$(make_tree "$FULL")"
+  CUR_TREE="$path"
+  echo "=== snapshot deep-scan at ${SHORT[$FULL]} $(date -Iseconds) ===" | tee -a "$WALK_LOG"
+  snap_args=(python3 -m vuln_agent.snapshot --config "$CONFIG" --ref "$FULL" --worktree "$path"
+             --records-root "$RECORDS_ROOT" --records-root-rel "$RECORDS_ROOT_REL"
+             --verdicts-dir "$VERDICTS")
+  [ -n "${OVERRIDE_MODEL:-}" ] && snap_args+=(--model "$OVERRIDE_MODEL")
+  SNAP_LOG="$RUN_LOGS/snapshot-${SHORT[$FULL]}.log"
+  rc=0
+  # stream progress live to the terminal AND the log file: a snapshot runs
+  # planner + one agent session per module (often hours), and redirecting
+  # everything to the log makes the run look hung; PIPESTATUS[0] keeps the
+  # agent's own exit code (not tee's) under pipefail
+  if [ -n "$RUN_TIMEOUT" ] && [ "$RUN_TIMEOUT" != 0 ] && command -v timeout >/dev/null 2>&1; then
+    timeout "${RUN_TIMEOUT}s" "${snap_args[@]}" 2>&1 | tee "$SNAP_LOG" || rc=${PIPESTATUS[0]}
+  else
+    "${snap_args[@]}" 2>&1 | tee "$SNAP_LOG" || rc=${PIPESTATUS[0]}
+  fi
+  free_tree "$path"
+  CUR_TREE=""
+  verdict="$(head -1 "$VERDICTS/$FULL~snapshot.txt" 2>/dev/null || true)"
+  case "$verdict" in
+    VERDICT:\ VULN_UPDATED*|VERDICT:\ NO_VULN)
+      sync_set_baseline "$FULL"
+      jq --arg s "$FULL" '.snapshot = $s' "$SYNC" > "$SYNC.tmp" 2>/dev/null \
+        && mv "$SYNC.tmp" "$SYNC" || rm -f "$SYNC.tmp"
+      commit_records "${SHORT[$FULL]}" "snapshot deep-scan (tree scanned at ${SHORT[$FULL]})"
+      echo "[${SHORT[$FULL]}] SNAPSHOT -> done ($verdict)" | tee -a "$WALK_LOG"
+      exit 0;;
+    *) die "snapshot failed (rc=$rc): $verdict — see logs/snapshot-${SHORT[$FULL]}.log";;
+  esac
+fi
+
+# ---- standalone validation mode: audit the records map without any agent calls ----
+if [ "$VALIDATE" = 1 ]; then
+  REF="${VALIDATE_REF:-HEAD}"
+  FULL="$(g rev-parse --verify --quiet "$REF^{commit}" || true)"
+  [ -n "$FULL" ] || die "commit not found for --validate: $REF"
+  load_meta "$FULL"
+  VPATH="$(make_tree "$FULL")"
+  CUR_TREE="$VPATH"
+  python3 -m vuln_agent.validate --records-root "$RECORDS_ROOT" --worktree "$VPATH" \
+    --report "$VERDICTS/validate-${SHORT[$FULL]}.md" --sha "$FULL" \
+    || { free_tree "$VPATH"; CUR_TREE=""; die "validation found errors (see above and $VERDICTS/validate-${SHORT[$FULL]}.md)"; }
+  free_tree "$VPATH"; CUR_TREE=""
+  echo "records validation passed at ${SHORT[$FULL]}"
+  exit 0
+fi
+
+# fail fast on an obviously missing model config (env VULN_MODEL overrides)
+[ -n "${OVERRIDE_MODEL:-}" ] || [ -n "$CFG_MODEL" ] || [ -n "${VULN_MODEL:-}" ] || \
+  die "no model configured: set llm.model in config.json or export VULN_MODEL"
+
+load_known_skips
+
 # ---- commit list ----
 rl=(--reverse)
 [ "$SKIP_MERGES" = true ] && rl+=(--no-merges)
-if [ -n "$SINGLE" ]; then SHAS=("$SINGLE")
-elif [ -n "$RANGE" ]; then mapfile -t SHAS < <(g rev-list "${rl[@]}" "$RANGE")
+# optional pathspec scope: process only commits touching the configured subdirectory
+sc=()
+[ -n "$SCOPE" ] && sc=(-- "$SCOPE")
+if [ -n "$SINGLE" ]; then
+  # normalize to the full SHA: SUBJ/SHORT are keyed by full SHAs and `set -u`
+  # aborts on a missing key (e.g. when the user passes a short sha)
+  FULL="$(g rev-parse --verify --quiet "$SINGLE^{commit}" || true)"
+  [ -n "$FULL" ] || die "commit not found in source repo: $SINGLE"
+  SHAS=("$FULL")
+elif [ -n "$RANGE" ]; then mapfile -t SHAS < <(g rev-list "${rl[@]}" "$RANGE" ${sc[@]+"${sc[@]}"})
 else
   BASELINE="$(jq -r '.baseline // ""' "$SYNC")"
-  if [ -z "$BASELINE" ]; then mapfile -t SHAS < <(g rev-list "${rl[@]}" HEAD)
-  else mapfile -t SHAS < <(g rev-list "${rl[@]}" "${BASELINE}..HEAD"); fi
+  if [ -z "$BASELINE" ]; then mapfile -t SHAS < <(g rev-list "${rl[@]}" HEAD ${sc[@]+"${sc[@]}"})
+  else mapfile -t SHAS < <(g rev-list "${rl[@]}" "${BASELINE}..HEAD" ${sc[@]+"${sc[@]}"}); fi
 fi
+load_processed
+
+# ---- retry commits that failed on a previous run (LLM outage, timeouts, ...) ----
+mapfile -t RETRY < <(requeue_failed)
+if [ "${#RETRY[@]}" -gt 0 ]; then
+  drops="$(printf '%s\n' "${RETRY[@]}" | jq -R . | jq -s -c .)"
+  jq --argjson d "$drops" \
+     '(.processed) |= map(select(. as $p | ($d | index($p)) == null)) | .failures = [] | .failed = 0' \
+     "$PROGRESS" > "$PROGRESS.tmp" && mv "$PROGRESS.tmp" "$PROGRESS"
+  for sha in "${RETRY[@]}"; do
+    unset "PROC[$sha]" 2>/dev/null || true
+    if [ "${#SHAS[@]}" -eq 0 ] || ! printf '%s\n' "${SHAS[@]}" | grep -qx "$sha"; then
+      SHAS+=("$sha")
+    fi
+  done
+  echo "requeuing ${#RETRY[@]} previously failed commit(s) for retry"
+fi
+
 [ "${#SHAS[@]}" -gt 0 ] || { echo "No new commits to process (baseline is at HEAD)."; exit 0; }
 
-load_processed
 load_meta "${SHAS[@]}"
 
 # ---- list mode ----
 if [ "$DO_LIST" = 1 ]; then
-  p=0; s=0; d=0
+  p=0; s=0; d=0; ps=0
   printf '%-12s %-8s %s\n' SHORT DECISION SUBJECT
   for sha in "${SHAS[@]}"; do
     subj="${SUBJ[$sha]:-?}"; short="${SHORT[$sha]:-??????????}"
     if [[ -v PROC["$sha"] ]]; then dec="DONE"; d=$((d+1))
-    elif [ -n "$SKIP_REGEX" ] && [[ $subj =~ $SKIP_REGEX ]]; then dec="SKIP"; s=$((s+1))
+    elif [[ -v CACHED_SKIP["$sha"] ]]; then dec="SKIP*"; ps=$((ps+1))
+    elif regex_skips "$sha" "$subj"; then dec="SKIP"; s=$((s+1))
     else dec="ANALYZE"; p=$((p+1)); fi
     printf '%-12s %-8s %s\n' "$short" "$dec" "$subj"
   done
-  echo "---"; echo "range=${#SHAS[@]} ANALYZE=$p SKIP=$s DONE=$d"
+  echo "---"; echo "range=${#SHAS[@]} ANALYZE=$p SKIP=$s DONE=$d preseeded=$ps"
+  [ "$ps" -gt 0 ] && echo "SKIP* = preseeded NO_VULN (--reuse-verdicts / --skip-list)"
   exit 0
-fi
-
-# ---- optional managed server ----
-if [ "$SERVE" = 1 ] && [ -z "$ATTACH" ]; then
-  SERVE_PORT="${SERVE_PORT:-4096}"
-  SERVE_LOG="$(mktemp -t vibe-serve.XXXXXX.log)" || die "mktemp failed"
-  echo "Starting opencode serve on port $SERVE_PORT (log: $SERVE_LOG) …"
-  opencode serve --port "$SERVE_PORT" >"$SERVE_LOG" 2>&1 &
-  SERVE_PID=$!; ATTACH="http://localhost:$SERVE_PORT"
-  sleep 3
 fi
 
 {
   echo "=== vuln-walk started $(date -Iseconds) ==="
-  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT"
+  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N record_hints=$([ "$RECORD_HINTS" = 1 ] && echo "$PRIOR_REC_N" || echo 0)"
 } | tee -a "$WALK_LOG"
 
 count=0; last_short=""
 for sha in "${SHAS[@]}"; do
   [[ -v PROC["$sha"] ]] && continue
   [ "$LIMIT" -gt 0 ] && [ "$count" -ge "$LIMIT" ] && { echo "Reached --limit $LIMIT; stopping." | tee -a "$WALK_LOG"; break; }
-  count=$((count+1)); last_short="${SHORT[$sha]}"
+  count=$((count+1)); last_short="${SHORT[$sha]:-??????????}"
   run_one "$sha" 2>&1 | tee -a "$WALK_LOG"
 done
 
@@ -340,4 +613,10 @@ commit_baseline_if_dirty "${last_short:-none}"
 echo "=== summary ===" | tee -a "$WALK_LOG"
 echo "sync baseline: $(jq -r '.baseline' "$SYNC")"
 jq '{processed:(.processed|length), updated, skipped, failed, failures, last_run}' "$PROGRESS"
+# token accounting across all agent verdicts
+token_sum() { # <verdicts-glob> -> "prompt completion total"
+  jq -s '[.[] | .usage? // empty] | {p:(map(.prompt_tokens // 0)|add // 0), c:(map(.completion_tokens // 0)|add // 0), t:(map(.total_tokens // 0)|add // 0)} | "\(.p) \(.c) \(.t)"' "$@" 2>/dev/null || echo "0 0 0"
+}
+read -r AP AC AT <<< "$(token_sum "$VERDICTS"/*.json)"
+echo "tokens agent: prompt=$AP completion=$AC total=$AT"
 gitw log --oneline -5 2>/dev/null | sed 's/^/  /'

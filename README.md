@@ -1,8 +1,9 @@
 # vibenerabilities — incremental security-analysis pipeline (portable kit)
 
 Generate a **map of security vulnerabilities and security issues** for any git project, in
-any language, by replaying its history commit-by-commit. For each commit, an opencode agent
-— in a fresh, small context — decides whether it **introduces** a vulnerability, **fixes**
+any language, by replaying its history commit-by-commit. For each commit, a purpose-built
+agent — **vuln_agent**, a stdlib-only Python package speaking any OpenAI-compatible API —
+in a fresh, small context decides whether it **introduces** a vulnerability, **fixes**
 one, or **reveals a previously-missed** pre-existing issue, and updates the records under
 `agent/project/vulnerabilities/` accordingly.
 
@@ -11,12 +12,15 @@ one, or **reveals a previously-missed** pre-existing issue, and updates the reco
 must be inspected against the actual diff.
 
 Each record captures the full **lifecycle** of an issue: the commit that introduced it
-(found via `git log`/`git blame` when the fix is detected retroactively) and every commit
-that fixed it (a single issue may be fixed across multiple commits — they are all appended
-to the same record).
+(found via `git log -S` / `git log --diff-filter=A` when the fix is detected
+retroactively) and every commit that fixed it (a single issue may be fixed across
+multiple commits — they are all appended to the same record).
 
 The outer loop is a bash script (**outside** every agent call), so no single agent ever
-holds the whole codebase in context.
+holds the whole codebase in context. The agent itself is a minimal single-purpose loop
+with seven hard-guarded tools (read-only git, read/list, search-records,
+write/edit-record, finish) — no shell, no general-purpose system prompt — so nearly the
+whole context window is spent on the actual commit.
 
 ## Quick start
 
@@ -31,7 +35,16 @@ git clone <project-url> ./someproject
 # 3. bootstrap (creates .gitignore, agent/project/, git repo, config)
 ./vibenerabilities/bootstrap.sh ./someproject
 
-# 4. preview, then run
+# 4. point the agent at your model (any OpenAI-compatible endpoint)
+$EDITOR vibenerabilities/config.json       # llm.model, llm.base_url
+                                            # ~32k-context model? set limits.profile = "small"
+export VULN_API_KEY=...                    # or whatever llm.api_key_env names
+
+# 5a. BIG HISTORY (thousands+ commits)? deep-scan the current tree instead:
+./vibenerabilities/run.sh --snapshot        # module-by-module scan of HEAD; later
+                                             # runs analyze only NEW commits
+
+# 5b. or replay the full history commit-by-commit:
 ./vibenerabilities/run.sh --list | tail -1     # how many commits to process
 ./vibenerabilities/run.sh --limit 20           # analyze first 20 commits (auto-committed)
 ./vibenerabilities/run.sh                      # continue from baseline to HEAD
@@ -43,15 +56,14 @@ git clone <project-url> ./someproject
 mywork/                                <- workspace (its own git repo)
   .gitignore                           project folder + tooling are gitignored
   someproject/                         (gitignored) the project under analysis
-  vibenerabilities/                    (gitignored) THIS solution (run.sh, bootstrap.sh, templates…)
-  .opencode/                           (gitignored) installed command + skill
+  vibenerabilities/                    (gitignored) THIS solution (run.sh, bootstrap.sh, vuln_agent/, templates…)
   agent/project/                       COMMITTED — the vulnerability map
     INDEX.md                           navigation hub + counts + Sync Status
     methodology.md                     generic methodology
     project-conventions.md             per-project specifics (you edit this)
     .vibenerabilities.json             last-processed commit (for restart-after-sync)
     vulnerabilities/
-      VULN-001-<slug>.md               one record per issue
+      VULN-001-<slug>.md               one record per issue (3-digit numbering, enforced at write time)
       VULN-002-<slug>.md
       …
     design/                            (optional) cross-cutting theme notes
@@ -60,25 +72,39 @@ mywork/                                <- workspace (its own git repo)
 Each `VULN-NNN-*.md` record contains:
 
 - **Summary**, **Classification** (CWE, severity), **Status** (`Introduced`/`Open`/`Fixed`).
-- **Affected Code** — concrete file paths and symbols.
+- **Affected Code** — repository-root-relative file paths and symbols.
 - **Evidence** — the vulnerable lines quoted from the source at the introducing commit.
-- **Introduced in** — commit SHA, date, subject (located via `git log -S`/`blame` when the
-  fix is detected retroactively).
+- **Introduced in** — commit SHA, date, subject (located via `git log -S` /
+  `git log --diff-filter=A` when the fix is detected retroactively).
 - **Fixed in** — one or more commits (multi-commit fixes are appended here, never split).
 - **Detection** — forward-analysis / retroactive-from-fix / late-discovery, plus confidence.
 
 ## How it works (per commit)
 
 1. `run.sh` checks the commit out into a disposable git worktree (stateful replay).
-2. `opencode run --command vuln-commit "<sha> <worktree>" --auto` — fresh session — runs
-   three detection passes (introduced / fixed / late-discovered), using `git -C <worktree>
-   log`/`blame` to locate origins when a fix is detected.
-3. If findings: the agent creates/updates `agent/project/vulnerabilities/VULN-*.md`
+2. A deterministic rename pre-pass (`vuln_agent/hygiene.py`) rewrites citations of source
+   paths the commit renamed — worktree-verified text substitutions, no agent call.
+3. `python3 -m vuln_agent --config … --sha <sha> --worktree <path> --records-root …
+   --records-root-rel … --verdicts-dir …` — fresh session — injects the commit metadata,
+   a rename-aware name-status, the full diff whenever it fits a size cap
+   (`limits.diff_chars`), and project conventions, then runs three detection passes
+   (introduced / fixed / late-discovered) through the guarded tools, using read-only git
+   history commands at the parent to locate origins when a fix is detected.
+4. If findings: the agent creates/updates `agent/project/vulnerabilities/VULN-NNN-<slug>.md`
    idempotently and refreshes `INDEX.md`. Multi-commit fixes **append** to the existing
    record — the agent reads existing records first and never duplicates.
-4. `run.sh` reads the agent's verdict, advances the committed baseline
-   (`agent/project/.vibenerabilities.json`), and **git-commits** the record changes
-   (`vulns(<project>): <subject>`).
+5. The records map is then **validated mechanically** (numbering, links, layout, source
+   paths, hub sections, summary drift); problems go back to the agent for repair rounds,
+   and in strict mode remaining errors flip the verdict to `ERROR` so broken records are
+   never published.
+6. `run.sh` reads the first line of `verdicts/<sha>.txt` (`VERDICT: VULN_UPDATED <files>`
+   / `VERDICT: NO_VULN` / `VERDICT: ERROR <reason>`), advances the committed baseline
+   (`agent/project/.vibenerabilities.json`), rewrites `INDEX.md`'s Sync Status and
+   reconciles the Findings table deterministically (`vuln_agent/hub.py`), and
+   **git-commits** the record changes (`vulns(<project>): <subject>`).
+
+A failed commit (LLM outage, timeout, validation error) rolls the baseline back to its
+parent and is requeued automatically on the next run — nothing is ever silently skipped.
 
 ## Restart after upstream changes
 
@@ -92,22 +118,45 @@ git -C someproject pull        # sync new changes
 
 `--reset-baseline` starts over from the project's first commit.
 
+## Fresh-workspace reruns
+
+A `NO_VULN` verdict is a pure function of the commit (diff + tree), so verdicts from a
+previous run of the same project replay for free: `run.sh --reuse-verdicts <old
+verdicts dir>` marks those commits clean with zero agent calls (`--skip-list FILE` lists
+SHAs by hand). `VULN_UPDATED` verdicts are never reused — the records map is rebuilt from
+scratch. With `--record-hints`, commits the prior run flagged get a reconsideration
+round: the prior run's actual record content is fed back before a `NO_VULN` flip is
+accepted. See `GUIDE.md` for the full semantics.
+
 ## Common options
 
 ```
---list               show PROCESS/DONE decisions, no agent calls
---dry-run            classify only (no record writes, no commits)
+--list               show ANALYZE/SKIP/DONE decisions, no agent calls
+--snapshot [REF]     deep-scan the CURRENT tree at REF (default HEAD): a planner
+                     request partitions the tree into modules, one agent session
+                     per module scans it; baseline jumps to REF. Resumes after
+                     interruption. Config snapshot.*
+--dry-run            classify only (no record writes, no baseline advance, no commits)
+--validate [S]       audit existing records against the tree at S (default HEAD):
+                     links, numbering, layout, source paths, stale references —
+                     no agent calls
+--reset-baseline     reset the committed baseline to the project's first commit
 --limit N            process at most N commits
 --range A..B         process a specific range
 --sha S              process a single commit
+--reuse-verdicts DIR replay NO_VULN verdicts from a previous run's verdicts dir
+--skip-list FILE     treat the commits listed in FILE as NO_VULN (one hash per line)
+--record-hints       with --reuse-verdicts: reconsideration round feeding the prior
+                     run's record content back on a NO_VULN flip
 --in-place           checkout in the source clone instead of a worktree
 --no-commit          don't git-commit this run
---stop-on-fail       halt on the first failed commit
---attach URL         attach to a running 'opencode serve' (faster for big batches)
---serve              manage an 'opencode serve' for the run
---model M            override the model
+--stop-on-fail       halt on the first failed commit (default: roll the baseline
+                     back to the parent, requeue next run, continue)
+--model M            override the model (or export VULN_MODEL)
 ```
 
-See `GUIDE.md` for porting to a new project/language, performance tips, and troubleshooting.
+See `GUIDE.md` for porting to a new project/language, performance tips, reruns, and
+troubleshooting.
 See `SECURITY.md` for the **important** trust model — the agent reads untrusted code.
-Requires: `git`, `jq`, `opencode`.
+Requires: `git`, `jq`, `python3` (>=3.8, stdlib only — no pip packages), and any
+OpenAI-compatible LLM endpoint.

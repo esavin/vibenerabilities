@@ -7,21 +7,67 @@
   "language": "@@LANGUAGE@@",
 
   "records_root": "agent/project",
-  "commit_command": "vuln-commit",
 
   "use_worktree": true,
   "skip_merges": true,
 
-  "$comment_commit_skip_regex": "Unlike vibedocing, the security pipeline does NOT skip any commit by message. fix:/chore:/etc. commits may be security fixes. Leave commit_skip_regex empty.",
   "commit_skip_regex": "",
+  "$comment_commit_skip_regex": "The security pipeline does NOT skip any commit: fix:/chore:/refactor: messages may be the only signal of a security fix. Leave commit_skip_regex empty. (If you set it anyway, run.sh only force-skips commits that rename/move/delete nothing.)",
 
   "scope": "",
-  "model": "",
-  "agent": "",
-  "auto": true,
+  "$comment_scope": "Optional pathspec: analyze only commits touching this subdirectory (e.g. 'src/'). Empty = whole tree.",
+
+  "limits": {
+    "$comment": "Context budget. profile 'default' = historical caps, compaction off. profile 'small' = preset for ~32k-context models: tighter caps on every injected blob plus history compaction (once a request reports prompt_tokens >= compact_threshold_tokens, older tool results are shrunk in place to compact_result_chars; the last compact_keep_groups rounds stay verbatim). Any explicit key here overrides the profile. Tune compact_threshold_tokens to your window (leave headroom for the reply).",
+    "profile": "default",
+    "tool_result_chars": 100000,
+    "git_output_chars": 150000,
+    "read_file_chars": 80000,
+    "list_dir_chars": 40000,
+    "diffstat_chars": 30000,
+    "diff_chars": 16000,
+    "name_status_chars": 20000,
+    "tree_digest_chars": 8000,
+    "conventions_chars": 12000,
+    "records_overview_chars": 6000,
+    "compact_threshold_tokens": 0,
+    "compact_keep_groups": 4,
+    "compact_result_chars": 2000
+  },
+
+  "snapshot": {
+    "$comment": "Snapshot deep-scan (run.sh --snapshot [REF]): scan the CURRENT tree at REF (default HEAD) for pre-existing vulnerabilities instead of replaying history - one planner request partitions the tree into modules, then one agent session per module scans it. The baseline jumps to REF; later runs analyze only newer commits. planner_model: model for the one planner request ('' = llm.model). max_modules: cap on the module partition (excess merges into 'misc'). max_steps: per-module session step budget (0 = llm.max_steps_initial).",
+    "planner_model": "",
+    "max_modules": 40,
+    "max_steps": 0
+  },
+
+  "validation": {
+    "$comment": "post-write records validation. mode: strict = remaining errors flip the verdict to ERROR (commit requeued); warn = report only; off. rounds: how many repair rounds the agent gets before the final verdict. path_check: severity of the 'cited repo path must exist in the worktree' check — 'warn' by default because vulnerability records legitimately cite HISTORICAL paths (the vulnerable file may no longer exist at later commits).",
+    "mode": "strict",
+    "rounds": 2,
+    "path_check": "warn"
+  },
+
   "run_timeout_seconds": 0,
 
   "auto_commit": true,
   "git_author_name": "vibenerabilities",
-  "git_author_email": "vibenerabilities@local"
+  "git_author_email": "vibenerabilities@local",
+
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "VULN_API_KEY",
+    "model": "",
+    "temperature": null,
+    "max_tokens": 0,
+    "max_steps": 24,
+    "max_steps_initial": 48,
+    "max_steps_cap": 48,
+    "request_timeout_seconds": 180,
+    "retries": 5,
+    "heartbeat_seconds": 60,
+    "extra_body": {},
+    "log_transcript": true
+  }
 }

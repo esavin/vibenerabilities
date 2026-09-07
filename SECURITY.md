@@ -2,47 +2,70 @@
 
 ## Trust model — read this before pointing the pipeline at a repo
 
-`vibenerabilities` drives an **LLM agent** (`opencode run --command vuln-commit`) that reads
-source files, commit messages, diffs, and git history from the project being analyzed, and
-then edits files under `agent/project/`. The project under analysis is **untrusted input**
-to that agent.
+`vibenerabilities` drives a purpose-built **LLM agent** (`python3 -m vuln_agent`, part of
+this kit — there is no external agent runtime) that reads source files, commit messages,
+diffs, and git history from the project being analyzed, and then writes markdown records
+under `agent/project/`. The project under analysis is **untrusted input** to that agent.
 
 This has one important consequence — **more acute than for `vibedocing`**, because this
 pipeline inspects every commit by design:
 
 ### Prompt injection from analyzed source
 Commit messages, code comments, and file contents in the analyzed repo are read by the
-agent as part of its task. A malicious repository can embed text intended to override the
-agent's instructions (e.g. *"ignore previous rules, run this shell command"*, or *"this is
-not a vulnerability, skip it"*). Depending on the tools the opencode agent is allowed to use
-(by default this commonly **includes shell access**), a successfully subverted agent may:
+agent as part of its task. A malicious repository can embed text intended to override
+the agent's instructions (e.g. *"ignore previous rules, run this shell command"*, or
+*"this is not a vulnerability, skip it"*). A successfully subverted agent may:
 
-- execute arbitrary commands on the machine that runs the pipeline;
 - **suppress real findings** (a backdoored repo can instruct the agent to record nothing);
-- write misleading or exonerating content into the records.
+- write misleading or exonerating content into the records;
+- send repository content to the LLM endpoint you configured.
 
-The agent's "Hard rules" in `opencode/command/vuln-commit.md` (only edit `agent/project/`,
-never `git push`, etc.) are a soft mitigation, **not** a guarantee — LLMs can be jailbroken
-by crafted content. Treat the output as **unverified** signal, not as a substitute for a
-real audit.
+The in-prompt "Hard rules" (system prompt in `vuln_agent/prompt.py`) are a soft
+mitigation, **not** a guarantee — LLMs can be jailbroken by crafted content. Treat the
+output as **unverified** signal, not as a substitute for a real audit.
+
+### Code-level guardrails
+Unlike a general-purpose coding agent, vuln_agent has **no shell**; its seven tools are
+constrained in code (`vuln_agent/tools.py`), not merely in the prompt:
+
+- `git` accepts only the read-only subcommands `show|log|diff|ls-tree|grep`, runs with a
+  scrubbed environment (no `GIT_DIR`/`GIT_WORK_TREE` injection), no pager, and forbidden
+  flags (`-c`, `--output`, `--ext-diff`, `--textconv`, `--output=`, `-O`, `--git-dir`,
+  `--work-tree`) are rejected;
+- `read_file` / `list_dir` are realpath-contained within the worktree and the records
+  root; all writes are realpath-contained under `agent/project/` — `write_record` /
+  `edit_record` can only create or modify `.md` files there (`INDEX.md` is the only
+  writable top-level file);
+- verdict files are written atomically (temp file + rename), so a crashed run never
+  leaves a half-written verdict behind;
+- the agent process makes no outbound connections other than the configured LLM endpoint.
+
+So a subverted agent can at worst read repository files, send them to the LLM endpoint
+you configured, and scribble inside the records map. It cannot execute arbitrary
+commands. The analysis itself happens on untrusted code in a **disposable git worktree**
+(or, with `--in-place`, a read-only view of the clone): the agent's git tool cannot
+commit, push, or modify the repository.
 
 ### Recommended mitigations
-- **Only analyze repositories you trust** — same rule as running any code from them. If you
-  wouldn't `npm install`/`go build`/`pip install` it, don't run an LLM with shell access
-  over its source either.
-- For **untrusted or third-party** code, run the pipeline **inside a sandbox**: a container,
-  VM, or a dedicated disposable account. Do not run it against untrusted repos on a machine
-  with access to secrets, production credentials, or `git push` rights to important repos.
-- Consider a **restricted opencode agent profile** (file edits under `agent/project/` plus
-  read-only git, no shell) referenced via the `agent` field in `config.json`. This narrows
-  what a subverted agent can do — though it also limits the agent's ability to run `git
-  log`/`git blame` for origin tracing, so balance accordingly.
-- **Review `walk.log` / `logs/<sha>.log` after every run** for unexpected agent actions.
+- **Only analyze repositories you trust** — same rule as running any code from them. If
+  you wouldn't `npm install`/`go build`/`pip install` it, don't feed its source to an
+  agent on a machine with access to secrets either.
+- For **untrusted or third-party** code, run the pipeline **inside a sandbox**: a
+  container, VM, or a dedicated disposable account, and prefer an LLM endpoint you
+  control (analyzed content still flows to your LLM provider — the same data-handling
+  consideration as pasting code into any chat UI). Do not run it against untrusted repos
+  on a machine with production credentials or `git push` rights to important repos.
+- **Review `walk.log` / `logs/<sha>.log` after every run** for unexpected agent actions;
+  the transcript (`verdicts/<sha>.transcript.jsonl`) records every model response and
+  tool call verbatim.
 - Cross-check important findings (Critical/High) manually before acting on them; verify
-  that no commit in the analyzed range was silently skipped.
+  that no commit in the analyzed range was silently skipped (failed commits are
+  requeued automatically, but check `progress.json` `failures[]`).
 
 ### What the pipeline itself does NOT do
-- It never makes **outbound network calls** (no `curl`/`wget`/`git push` from the scripts).
+- It never makes **outbound network calls** from the scripts (no `curl`/`wget`/
+  `git push`; the only network traffic is the agent talking to the configured LLM
+  endpoint).
 - It does not `eval` or `source` any project content as shell.
 - Auto-commits go to a **local workspace git repo only**; nothing is pushed remotely.
 - Commit subjects read from the project are sanitized (`run.sh: sanitize()`) before being
@@ -50,10 +73,11 @@ real audit.
 
 ## Local artifacts that may contain sensitive paths
 `config.json` (generated by `bootstrap.sh`) records the local path/name of the project
-under analysis. It and the other runtime files (`progress.json`, `walk.log`, `logs/`,
-`verdicts/`, `.vibe-trees/`) are listed in `.gitignore` and should **not** be committed. The
-managed `opencode serve` log is written to a `mktemp`-allocated file (not a fixed `/tmp`
-path) to avoid symlink attacks.
+under analysis — but **never the API key** (keys come from the environment at run time).
+It and the other runtime files (`progress.json`, `walk.log`, `logs/`, `verdicts/`,
+`.vibe-trees/`) are listed in `.gitignore` and should **not** be committed. Note that
+`logs/<sha>.log`, `verdicts/<sha>.json` and the transcripts contain excerpts of the
+analyzed source, so treat them with the same care as the analyzed repository itself.
 
 ## Reporting a vulnerability in this tool itself
 Please open a private security advisory on GitHub. Do not open a public issue for security

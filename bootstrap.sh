@@ -2,7 +2,7 @@
 #
 # vibenerabilities/bootstrap.sh — one-time setup of a security-analysis workspace.
 #
-# Usage (from the working folder where you unzipped the kit and cloned the project):
+# Usage (from the working folder where you cloned the kit and the project):
 #     ./vibenerabilities/bootstrap.sh <path-to-project>
 #
 # What it does:
@@ -10,7 +10,7 @@
 #   2. Creates agent/project/ (vulnerabilities/, design/) seeded from templates.
 #   3. Initializes a git repo in the CURRENT folder (if absent) and makes an initial commit.
 #   4. Writes vibenerabilities/config.json tuned to your project.
-#   5. Installs the opencode command + skill into .opencode/.
+#   5. Verifies python3 (>=3.8) for the built-in agent and prints LLM setup hints.
 #
 # After bootstrap, run:  ./vibenerabilities/run.sh --list   then   ./vibenerabilities/run.sh
 #
@@ -25,7 +25,9 @@ TPL="$PIPELINE_DIR/templates"
 TODAY="$(date +%Y-%m-%d)"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing dependency: $1" >&2; exit 1; }; }
-need git; need jq
+need git; need jq; need python3
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' \
+  || { echo "python3 >= 3.8 required" >&2; exit 1; }
 
 # ---- resolve project ----
 PROJECT_DIR="$(cd "$PROJECT_ARG" 2>/dev/null && pwd)" || { echo "project path not found: $PROJECT_ARG" >&2; exit 1; }
@@ -34,7 +36,8 @@ PROJECT_NAME="$(basename "$PROJECT_DIR")"
 
 # is the project inside the workspace? -> gitignore its relative path; else absolute source_root
 if [[ "$PROJECT_DIR" == "$WORK_DIR"/* ]]; then
-  PROJECT_REL="$(realpath --relative-to="$WORK_DIR" "$PROJECT_DIR")"
+  # strip the workspace prefix (GNU realpath --relative-to is unavailable on macOS/BSD)
+  PROJECT_REL="${PROJECT_DIR#"$WORK_DIR"/}"
   SOURCE_REL="$PROJECT_REL"
 else
   PROJECT_REL=""
@@ -74,19 +77,22 @@ render() { # <infile> <outfile>
   printf '%s\n' "$content" > "$2"
 }
 
+COMMIT_COUNT="$(git -C "$PROJECT_DIR" rev-list --count --all 2>/dev/null || echo 0)"
+
 echo ">> workspace:   $WORK_DIR"
 echo ">> project:     $PROJECT_NAME  ($PROJECT_DIR)"
 echo ">> source_root: $SOURCE_REL"
 echo ">> branch:      $BRANCH   language: $LANGUAGE ($LAYOUT)"
+echo ">> history:     $COMMIT_COUNT commit(s)"
+echo ">> skip regex:  (none — every commit is analyzed by design)"
 
 # ---- 1. .gitignore ----
 {
   echo "# The project under analysis — tracked by its own repository, not by this workspace."
   [ -n "$PROJECT_REL" ] && echo "/$PROJECT_REL/"
   echo
-  echo "# The security-analysis tooling (local; not part of the recorded output)."
+  echo "# The security-analysis tooling (local; not part of the analyzed output)."
   echo "/vibenerabilities/"
-  echo "/.opencode/"
   echo
   echo "# Disposable git worktrees created by the walker (stateful replay)."
   echo "/.vibe-trees/"
@@ -95,7 +101,8 @@ echo ">> wrote .gitignore"
 
 # ---- 2. agent/project/ from templates ----
 mkdir -p "$WORK_DIR/agent/project/vulnerabilities" "$WORK_DIR/agent/project/design"
-# methodology.md is generic/portable and never user-customized, so a plain copy is correct.
+# methodology.md is generic/portable and never user-customized, so a plain copy is
+# correct. (cp -n returns non-zero on skip, which would trigger a fallback that overwrites.)
 cp "$TPL/methodology.md" "$WORK_DIR/agent/project/methodology.md"
 render "$TPL/project-conventions.md" "$WORK_DIR/agent/project/project-conventions.md"
 render "$TPL/INDEX.md" "$WORK_DIR/agent/project/INDEX.md"
@@ -125,27 +132,52 @@ fi
 render "$TPL/config.json" "$PIPELINE_DIR/config.json"
 echo ">> wrote vibenerabilities/config.json"
 
-# ---- 5. install opencode command + skill ----
-mkdir -p "$WORK_DIR/.opencode/command" "$WORK_DIR/.opencode/skills"
-[ -d "$PIPELINE_DIR/opencode/command" ] && cp -f "$PIPELINE_DIR"/opencode/command/* "$WORK_DIR/.opencode/command/" 2>/dev/null || true
-[ -d "$PIPELINE_DIR/opencode/skills" ] && cp -rf "$PIPELINE_DIR"/opencode/skills/* "$WORK_DIR/.opencode/skills/" 2>/dev/null || true
-echo ">> installed opencode command + skill into .opencode/"
+# ---- 5. agent runtime sanity + LLM setup hints ----
+echo ">> agent runtime: $(python3 --version 2>&1) (stdlib only; no pip packages needed)"
 
 cat <<EOF
 
-=========================================================
-  Workspace ready.
-=========================================================
+LLM setup (before the first run):
+  1. Set "llm.model" in vibenerabilities/config.json - any model behind an
+     OpenAI-compatible API.
+  2. Set "llm.base_url" there too if you are not using OpenAI directly
+     (OpenRouter, DeepSeek, Groq, vLLM, Ollama, LiteLLM, ...).
+  3. Export your API key:  export VULN_API_KEY=...
+     (name configurable via "llm.api_key_env"; local gateways need no key)
+
+EOF
+
+cat <<EOF
+
+=======================================================
+ Workspace ready.
+=======================================================
 Next:
   ./vibenerabilities/run.sh --list | tail -1      # preview: how many commits to process
   ./vibenerabilities/run.sh --dry-run --limit 20  # classify only (no writes, no commits)
   ./vibenerabilities/run.sh --limit 20            # analyze first 20 commits (auto-committed)
   ./vibenerabilities/run.sh                       # continue from baseline to HEAD
+EOF
+
+if [ "${COMMIT_COUNT:-0}" -ge 2000 ]; then
+  cat <<EOF
+
+Large history detected ($COMMIT_COUNT commits):
+  ./vibenerabilities/run.sh --snapshot           # deep-scan the CURRENT tree for
+                                                  # pre-existing vulnerabilities
+                                                  # (module by module), then analyze
+                                                  # only NEW commits - hours instead
+                                                  # of weeks for huge repos
+EOF
+fi
+
+cat <<EOF
 
 Restart after syncing new upstream changes into '$SOURCE_REL':
   ./vibenerabilities/run.sh                       # resumes from the committed baseline
 
-Edit per-project specifics any time:
+Edit per-project specifics any time (the single most useful section is
+"Project-specific dangerous APIs"):
   agent/project/project-conventions.md
   vibenerabilities/config.json
 EOF
