@@ -56,6 +56,12 @@ WALK_LOG="$PIPELINE_DIR/walk.log"
 VERDICTS="$PIPELINE_DIR/verdicts"
 RUN_LOGS="$PIPELINE_DIR/logs"
 TREES="$WORK_DIR/.vibe-trees"
+# R1 parallel classify-ahead: per-window COPY of the records map read by the
+# classify workers (the live map is mutated concurrently by the record
+# replay). Lives inside .vibe-trees (gitignored; dot-prefixed, so the
+# interrupt sweep's glob skips it).
+SNAP="$TREES/.classify-snap"
+CLASSIFY_PID=""
 
 # make `python3 -m vuln_agent` importable regardless of the caller's cwd
 export PYTHONPATH="$PIPELINE_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -314,10 +320,31 @@ free_tree() { # <path>
 # ---- cleanup on exit / interrupt: free any in-flight worktree, prune ----
 cleanup() {
   if [ -n "${CUR_TREE:-}" ]; then free_tree "$CUR_TREE" 2>/dev/null || true; CUR_TREE=""; fi
+  # kill an in-flight classify batch first: the batch subshell's trap kills
+  # its classify_one workers, whose traps kill their agent processes
+  if [ -n "${CLASSIFY_PID:-}" ]; then classify_stop; fi
   [ -n "${PREFETCH_PID:-}" ] && kill "$PREFETCH_PID" 2>/dev/null || true
-  [ -n "${SOURCE_DIR:-}" ] && git -C "$SOURCE_DIR" worktree prune 2>/dev/null || true
+  if [ -n "${SOURCE_DIR:-}" ]; then
+    git -C "$SOURCE_DIR" worktree prune 2>/dev/null || true
+    if [ "${PARALLEL:-0}" -ge 2 ]; then
+      # workers killed mid-session leave their worktrees behind (their
+      # one-shot agent processes die on their own after the current
+      # request) - sweep so a restart starts clean. The glob skips
+      # dot-entries (.classify-snap), so an in-flight snapshot copy that
+      # no longer has readers is left for the next classify_start.
+      local d
+      for d in "$TREES"/*; do [ -d "$d" ] || continue; rm -rf "$d" 2>/dev/null || true; done
+      git -C "$SOURCE_DIR" worktree prune 2>/dev/null || true
+    fi
+  fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# INT/TERM must STOP the walk (the EXIT handler alone would run and the
+# script would continue at the interruption point - fine for a foreground
+# agent call under `|| rc=$?`, catastrophic for a parallel walk mid-replay).
+# The second cleanup via the EXIT trap is idempotent.
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # ---- commit_skip_regex gate ----
 # Ships EMPTY (see config): every commit is analyzed by design. When a user sets
@@ -358,15 +385,121 @@ prog_pos() { # <sha> -> "N/M"
   fi
 }
 
+# ---- R1: parallel classify-ahead + ordered record replay (--parallel K) ----
+# K workers run classify-only sessions over a window of W commits against a
+# COPY of the records map taken when the window's classification starts
+# (slightly stale - safe by design: Pass B detects fixes from the DIFF, not
+# from the records, and Pass C does not read records at all, so a stale map
+# can only cause a DUPLICATE record later, never a false NO_VULN;
+# duplicates collapse in the record phase, which reads existing records
+# before writing). The main process stays the ONLY writer (records,
+# INDEX.md, baseline, progress, git): a classification NO_VULN is final
+# (a pure function of the commit - the same contract --reuse-verdicts
+# already relies on); everything else is replayed SEQUENTIALLY, in history
+# order, as a full record session against the live records map. The next
+# window's classification overlaps the current window's replay, so at most
+# K classify workers + 1 record session are in flight.
+
+classify_eligible() { # <sha> -> rc 0 when a classify-only session may decide it
+  # Must stay deterministic within a run (re-derived at replay time).
+  # Preseeded/regex skips are finalized by the replay itself at zero cost;
+  # prior-run hint commits need the record phase's reconsideration round;
+  # rename/delete commits owe deterministic record hygiene (the rename
+  # pre-pass) that only a record session performs.
+  local sha="$1"
+  [[ -v CACHED_SKIP["$sha"] ]] && return 1
+  if [ "$RECORD_HINTS" = 1 ] && [[ -v PRIOR_REC["$sha"] ]]; then return 1; fi
+  regex_skips "$sha" "${SUBJ[$sha]}" && return 1
+  g rev-parse --verify --quiet "$sha^" >/dev/null 2>&1 && ! has_rd_changes "$sha"
+}
+
+classify_one() { # <sha> <records-snapshot> — worker: one classify-only session
+  # runs as a background job of the classify batch: kill its own agent
+  # processes on termination ($BASHPID = THIS subshell, never $$ = main)
+  trap 'trap - TERM INT; pkill -P "$BASHPID" 2>/dev/null; exit 143' TERM INT
+  local sha="$1" snap="$2" short subject path rc v model tag
+  short="${SHORT[$sha]:-??????????}"; subject="${SUBJ[$sha]:-?}"
+  tag="[$(prog_pos "$sha")] "
+  path="$(make_tree "$sha")" || {
+    echo "${tag}[$short] classify: worktree setup failed" | tee -a "$WALK_LOG" >&2
+    return 1
+  }
+  local ag=(python3 -m vuln_agent --config "$CONFIG" --sha "$sha" --worktree "$path"
+            --records-root "$snap" --records-root-rel "$RECORDS_ROOT_REL"
+            --verdicts-dir "$VERDICTS" --classify-only)
+  model="${OVERRIDE_MODEL:-$CFG_MODEL}"; [ -n "$model" ] && ag+=(--model "$model")
+  echo "${tag}[$short] CLASSIFY       $subject" | tee -a "$WALK_LOG"
+  # never inherit a stale verdict of a previous attempt (same rule as the
+  # record phase below): a crashed worker that wrote nothing must fall back
+  # to a record session, not replay an old decision
+  rm -f "$VERDICTS/$sha.txt" "$VERDICTS/$sha.json"
+  rc=0
+  if [ -n "$RUN_TIMEOUT" ] && [ "$RUN_TIMEOUT" != 0 ] && command -v timeout >/dev/null 2>&1; then
+    timeout "${RUN_TIMEOUT}s" "${ag[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
+  else
+    "${ag[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
+  fi
+  free_tree "$path"
+  v="$(head -1 "$VERDICTS/$sha.txt" 2>/dev/null || true)"
+  # ERROR / missing verdict is NOT fatal: the replay falls back to a full
+  # record session for this commit (recall before speed)
+  echo "${tag}[$short] classify -> ${v:-NO_VERDICT(rc=$rc)}" | tee -a "$WALK_LOG"
+  return 0
+}
+
+classify_start() { # <shas...>: launch the K-slot classify batch in background
+  [ "$#" -gt 0 ] || { CLASSIFY_PID=""; return 0; }
+  # snapshot the records map AS THE WINDOW STARTS: classify sessions read
+  # this copy; the live map is concurrently mutated by the record replay
+  rm -rf "$SNAP"; mkdir -p "$SNAP"
+  cp -a "$RECORDS_ROOT/." "$SNAP/" 2>/dev/null || true
+  local shas=("$@")
+  (
+    # propagate termination to the classify_one workers (their own traps
+    # kill the agent processes); BASHPID = this batch subshell, never $$
+    trap 'trap - TERM INT; pkill -P "$BASHPID" 2>/dev/null; exit 143' TERM INT
+    local sha
+    for sha in "${shas[@]}"; do
+      while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL" ]; do wait -n || true; done
+      classify_one "$sha" "$SNAP" &
+    done
+    wait || true
+  ) &
+  CLASSIFY_PID=$!
+}
+
+classify_wait() { # block until the running classify batch is done
+  [ -n "$CLASSIFY_PID" ] || return 0
+  wait "$CLASSIFY_PID" 2>/dev/null || true
+  CLASSIFY_PID=""
+}
+
+classify_stop() { # kill the classify batch and its workers (limit/interrupt)
+  [ -n "$CLASSIFY_PID" ] || return 0
+  kill "$CLASSIFY_PID" 2>/dev/null || true
+  pkill -P "$CLASSIFY_PID" 2>/dev/null || true
+  # NO wait here: a worker's TERM trap is deferred by bash until its
+  # in-flight agent request finishes (a foreground child), and the walk
+  # must not block on that. The one-shot orphans error out on the swept
+  # worktree, write nothing durable (classify mode never writes records),
+  # and any late verdict file is ignored: the next run re-classifies
+  # commits it never replayed.
+  CLASSIFY_PID=""
+}
+
 # ---- run one commit ----
-run_one() { # <sha>
-  local sha="$1" short subject path args verdict rc kind parent="" newnotes=""
+run_prechecks() { # <sha> -> rc 0 when fully handled (preseeded/regex skip)
+  local sha="$1" short subject src
   short="${SHORT[$sha]}"; subject="${SUBJ[$sha]}"
 
   if [[ -v CACHED_SKIP["$sha"] ]]; then
     # preseeded NO_VULN (from --reuse-verdicts or --skip-list): replay it, no agent call
-    local src="${CACHED_SKIP[$sha]}"
     echo "${PTAG}[$short] CLEAN (preseeded)  $subject"
+    if [ "$CLASSIFY_ONLY" = 1 ]; then
+      echo "${PTAG}[$short] -> would-clean (preseeded)  [dry-run]"
+      return 0
+    fi
+    src="${CACHED_SKIP[$sha]}"
     if [[ "$src" != list ]]; then
       # copy the old verdict artifacts for traceability (skip if same verdicts dir)
       if [ "$(cd "$(dirname "$src")" && pwd)" != "$VERDICTS" ]; then
@@ -383,11 +516,21 @@ run_one() { # <sha>
 
   if regex_skips "$sha" "$subject"; then
     echo "${PTAG}[$short] SKIP (regex)  $subject"
+    if [ "$CLASSIFY_ONLY" = 1 ]; then
+      echo "${PTAG}[$short] -> would-clean (regex)  [dry-run]"
+      return 0
+    fi
     printf 'VERDICT: NO_VULN(regex)\n' > "$VERDICTS/$sha.txt"
     sync_set_baseline "$sha"
     save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1'
     return 0
   fi
+  return 1
+}
+
+record_session() { # <sha> — full agent session against the LIVE records map
+  local sha="$1" short subject path args verdict rc kind parent="" newnotes=""
+  short="${SHORT[$sha]}"; subject="${SUBJ[$sha]}"
 
   path="$(make_tree "$sha")"
   CUR_TREE="$path"
@@ -442,7 +585,7 @@ run_one() { # <sha>
     clean)   sync_set_baseline "$sha"
              save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1';;
     *)       # failure is NOT "processed": roll the baseline back to the parent so
-             # the next run's rev-list range includes this commit again
+              # the next run's rev-list range includes this commit again
              parent="$(g rev-parse --verify --quiet "$sha^" 2>/dev/null || true)"
              sync_set_baseline "${parent:-}"
              save_progress --arg b "$sha" --arg f "$short" '.processed += [$b] | .failed += 1 | .failures += [$f]'
@@ -450,6 +593,39 @@ run_one() { # <sha>
   esac
   echo "${PTAG}[$short] -> $kind ($verdict)"
   if [ -n "$newnotes" ]; then printf '%s\n' "$newnotes"; fi
+}
+
+run_one() { # <sha> — sequential walk step: prechecks, then a full session
+  run_prechecks "$1" && return 0
+  record_session "$1"
+}
+
+replay_one() { # <sha> — parallel replay step, in history order
+  local sha="$1" v short subject
+  run_prechecks "$sha" && return 0
+  if classify_eligible "$sha"; then
+    # only commits this run actually classified carry a trusted verdict here
+    # (direct-record commits skip classification and record_session clears
+    # any stale verdict file before running)
+    v="$(head -1 "$VERDICTS/$sha.txt" 2>/dev/null || true)"
+    case "$v" in
+      VERDICT:\ NO_VULN*)
+        # classification NO_VULN is FINAL: a pure function of the commit
+        # (diff + tree), independent of the records snapshot's freshness
+        short="${SHORT[$sha]}"; subject="${SUBJ[$sha]}"
+        if [ "$CLASSIFY_ONLY" = 1 ]; then
+          echo "${PTAG}[$short] -> would-clean (classified)  [dry-run]"
+          return 0
+        fi
+        echo "${PTAG}[$short] CLEAN (classified)  $subject"
+        sync_set_baseline "$sha"
+        save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1'
+        return 0;;
+    esac
+  fi
+  # VULN candidate, classify ERROR, or a direct-record commit: full record
+  # session against the LIVE records map (single writer: this process)
+  record_session "$sha"
 }
 
 # ---- CLI ----
@@ -488,6 +664,16 @@ Usage: run.sh [options]
                   and ask for one reconsideration round before accepting
                   NO_VULN. Helps borderline findings converge across reruns
                   instead of flip-flopping with sampling noise.
+  --parallel [K]  Parallel classify-ahead: K workers (default 4, or config
+                  parallel.workers) run classify-only sessions over windows
+                  of commits (parallel.window, default 32, or --parallel-window
+                  W) against a per-window SNAPSHOT of the records map; the
+                  main process then replays each window IN HISTORY ORDER -
+                  classified NO_VULN commits are final, everything else
+                  (VULN candidates, classify failures, rename/delete and
+                  hint commits) gets a full record session as the only
+                  writer. Roughly 3-4x faster on large histories; needs
+                  worktree mode. Watch live classification in walk.log.
   --in-place      Checkout each commit in the source clone instead of a worktree.
   --stop-on-fail  Halt on the first failed commit (default: record, roll the
                   baseline back to the parent and continue; failed commits are
@@ -501,6 +687,7 @@ DO_LIST=0; RESET_BASE=0; LIMIT=0; RANGE=""; SINGLE=""; OVERRIDE_MODEL=""
 STOP_ON_FAIL=0; CLASSIFY_ONLY=0; VALIDATE=0; VALIDATE_REF=""
 REUSE_VERDICTS=""; SKIP_LIST=""; RECORD_HINTS=0
 SNAPSHOT=0; SNAPSHOT_REF=""
+PARALLEL=0; PAR_WINDOW=""   # -1 = --parallel given without N
 while [ $# -gt 0 ]; do
   case "$1" in
     --list) DO_LIST=1;;
@@ -516,6 +703,9 @@ while [ $# -gt 0 ]; do
     --reuse-verdicts) REUSE_VERDICTS="${2:?--reuse-verdicts needs DIR}"; shift;;
     --skip-list) SKIP_LIST="${2:?--skip-list needs FILE}"; shift;;
     --record-hints) RECORD_HINTS=1;;
+    --parallel) PARALLEL=-1
+                 if [ $# -ge 2 ] && [[ "$2" =~ ^[1-9][0-9]*$ ]]; then PARALLEL="$2"; shift; fi;;
+    --parallel-window) PAR_WINDOW="${2:?--parallel-window needs W}"; shift;;
     --in-place) USE_WORKTREE=false;;
     --stop-on-fail) STOP_ON_FAIL=1;;
     --no-commit) AUTO_COMMIT=false;;
@@ -526,6 +716,30 @@ while [ $# -gt 0 ]; do
   shift
 done
 export USE_WORKTREE STOP_ON_FAIL CLASSIFY_ONLY OVERRIDE_MODEL
+
+# ---- --parallel resolution (R1 classify-ahead) ----
+PAR_CFG_K="$(jstr '.parallel.workers')"; PAR_CFG_W="$(jstr '.parallel.window')"
+if [ "$PARALLEL" = -1 ]; then
+  # flag without N: config default, else 4
+  if [ -n "$PAR_CFG_K" ] && [[ "$PAR_CFG_K" =~ ^[1-9][0-9]*$ ]]; then PARALLEL="$PAR_CFG_K"; else PARALLEL=4; fi
+fi
+if [ "$PARALLEL" -ge 2 ] 2>/dev/null; then
+  { [ -z "$PAR_WINDOW" ] || ! [[ "$PAR_WINDOW" =~ ^[1-9][0-9]*$ ]]; } && PAR_WINDOW="${PAR_CFG_W:-32}"
+  [[ "$PAR_WINDOW" =~ ^[1-9][0-9]*$ ]] || die "--parallel-window needs a positive integer"
+  if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] \
+     || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -lt 3 ]; }; then
+    die "--parallel needs bash >= 4.3 (wait -n)"
+  fi
+  # the walk itself (not --list/--validate) needs these
+  if [ "$DO_LIST" = 0 ] && [ "$VALIDATE" = 0 ]; then
+    [ "$USE_WORKTREE" = true ] || die "--parallel requires worktree mode (config use_worktree: true, no --in-place): K workers each check out their own commit"
+    [ -z "$SINGLE" ] || die "--parallel cannot be combined with --sha (a single commit gains nothing)"
+  fi
+  command -v pkill >/dev/null 2>&1 \
+    || echo "warn: pkill not found - an interrupted classify worker's agent may linger briefly" >&2
+else
+  PARALLEL=0   # --parallel 1 = plain sequential walk
+fi
 
 init_sync; init_progress
 
@@ -538,8 +752,8 @@ if [ "$SNAPSHOT" = 1 ]; then
   if [ "$DO_LIST" != 0 ] || [ "$RESET_BASE" != 0 ] || [ "$VALIDATE" != 0 ] \
      || [ "$CLASSIFY_ONLY" != 0 ] || [ -n "$SINGLE" ] || [ -n "$RANGE" ] \
      || [ "$LIMIT" != 0 ] || [ -n "$REUSE_VERDICTS" ] || [ -n "$SKIP_LIST" ] \
-     || [ "$RECORD_HINTS" != 0 ]; then
-    die "--snapshot cannot be combined with --list/--dry-run/--validate/--reset-baseline/--sha/--range/--limit/--reuse-verdicts/--skip-list/--record-hints"
+     || [ "$RECORD_HINTS" != 0 ] || [ "$PARALLEL" != 0 ]; then
+    die "--snapshot cannot be combined with --list/--dry-run/--validate/--reset-baseline/--sha/--range/--limit/--reuse-verdicts/--skip-list/--record-hints/--parallel"
   fi
   [ -n "${OVERRIDE_MODEL:-}" ] || [ -n "$CFG_MODEL" ] || [ -n "${VULN_MODEL:-}" ] || \
     die "no model configured: set llm.model in config.json or export VULN_MODEL"
@@ -667,7 +881,7 @@ fi
 
 {
   echo "=== vuln-walk started $(date -Iseconds) ==="
-  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} todo=$QUEUE_TOTAL total=$PROG_TOTAL worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N record_hints=$([ "$RECORD_HINTS" = 1 ] && echo "$PRIOR_REC_N" || echo 0)"
+  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} todo=$QUEUE_TOTAL total=$PROG_TOTAL worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N record_hints=$([ "$RECORD_HINTS" = 1 ] && echo "$PRIOR_REC_N" || echo 0)$( [ "$PARALLEL" -ge 2 ] && printf ' parallel=%d window=%d' "$PARALLEL" "$PAR_WINDOW" || true )"
 } | tee -a "$WALK_LOG"
 
 # ---- triage prefetch worker (config triage.enabled + triage.prefetch_ahead) ----
@@ -686,14 +900,73 @@ if [ "$(jq -r '.triage.enabled // false' "$CONFIG")" = "true" ]; then
   fi
 fi
 
+# ---- R1 walk: classify windows ahead, replay each window in history order ----
+WALK_TODO=(); WALK_RIDX=0
+slice_window() { # print up to PAR_WINDOW todo shas from WALK_RIDX; $1 = replayed so far (--limit budget)
+  local i="$WALK_RIDX" done_ct="$1" n=0 total="${#WALK_TODO[@]}"
+  while [ "$i" -lt "$total" ] && [ "$n" -lt "$PAR_WINDOW" ]; do
+    if [ "$LIMIT" -gt 0 ] && [ $((done_ct + n)) -ge "$LIMIT" ]; then break; fi
+    printf '%s\n' "${WALK_TODO[$i]}"
+    i=$((i + 1)); n=$((n + 1))
+  done
+}
+
+window_classifiable() { # print the window's shas eligible for a classify-only session
+  local sha
+  for sha in "$@"; do
+    classify_eligible "$sha" && printf '%s\n' "$sha"
+  done
+}
+
+parallel_walk() {
+  local sha wsha stop=0
+  for sha in "${SHAS[@]}"; do [[ -v PROC["$sha"] ]] || WALK_TODO+=("$sha"); done
+  [ "${#WALK_TODO[@]}" -gt 0 ] || { echo "No commits to process."; return 0; }
+  echo "parallel: workers=$PARALLEL window=$PAR_WINDOW commits=${#WALK_TODO[@]} (classify-only sessions run against a records snapshot; replay is sequential)" | tee -a "$WALK_LOG"
+
+  local win=() fwin=() cwin=()
+  mapfile -t win < <(slice_window 0)
+  WALK_RIDX=$((WALK_RIDX + ${#win[@]}))
+  mapfile -t cwin < <(window_classifiable ${win[@]+"${win[@]}"})
+  classify_start ${cwin[@]+"${cwin[@]}"}
+  while [ "${#win[@]}" -gt 0 ]; do
+    classify_wait                       # this window is fully classified
+    # classify-ahead: kick off the NEXT window's classification so it runs
+    # while this one replays (bounded: one classify batch of K slots in flight)
+    mapfile -t fwin < <(slice_window "$count")
+    WALK_RIDX=$((WALK_RIDX + ${#fwin[@]}))
+    mapfile -t cwin < <(window_classifiable ${fwin[@]+"${fwin[@]}"})
+    classify_start ${cwin[@]+"${cwin[@]}"}
+    for wsha in "${win[@]}"; do
+      if [ "$LIMIT" -gt 0 ] && [ "$count" -ge "$LIMIT" ]; then
+        echo "Reached --limit $LIMIT; stopping." | tee -a "$WALK_LOG"; stop=1; break
+      fi
+      count=$((count+1)); QUEUE_POS=$count; last_short="${SHORT[$wsha]:-??????????}"
+      PTAG="[$(prog_pos "$wsha")] "
+      replay_one "$wsha" 2>&1 | tee -a "$WALK_LOG"
+    done
+    [ "$stop" = 1 ] && break
+    win=()
+    [ "${#fwin[@]}" -gt 0 ] && win=("${fwin[@]}")
+  done
+  # a batch for a window the --limit cut off may still be running: kill it
+  # (its classification would never be replayed this run)
+  classify_stop
+  rm -rf "$SNAP"
+}
+
 count=0; last_short=""
-for sha in "${SHAS[@]}"; do
-  [[ -v PROC["$sha"] ]] && continue
-  [ "$LIMIT" -gt 0 ] && [ "$count" -ge "$LIMIT" ] && { echo "Reached --limit $LIMIT; stopping." | tee -a "$WALK_LOG"; break; }
-  count=$((count+1)); QUEUE_POS=$count; last_short="${SHORT[$sha]:-??????????}"
-  PTAG="[$(prog_pos "$sha")] "
-  run_one "$sha" 2>&1 | tee -a "$WALK_LOG"
-done
+if [ "$PARALLEL" -ge 2 ]; then
+  parallel_walk
+else
+  for sha in "${SHAS[@]}"; do
+    [[ -v PROC["$sha"] ]] && continue
+    [ "$LIMIT" -gt 0 ] && [ "$count" -ge "$LIMIT" ] && { echo "Reached --limit $LIMIT; stopping." | tee -a "$WALK_LOG"; break; }
+    count=$((count+1)); QUEUE_POS=$count; last_short="${SHORT[$sha]:-??????????}"
+    PTAG="[$(prog_pos "$sha")] "
+    run_one "$sha" 2>&1 | tee -a "$WALK_LOG"
+  done
+fi
 
 # stop the prefetch worker before the summary: the walk is done, further triage
 # calls would only bill the endpoint for decisions nobody will read

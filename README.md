@@ -126,6 +126,21 @@ The agent also persists a provider-reported context window
 later sessions seed their compaction threshold instead of re-discovering the
 limit the hard way.
 
+**Parallel classify-ahead** (`--parallel K`, worktree mode only): a NO_VULN
+verdict is a pure function of the commit, so K workers can *classify*
+commits ahead of the walk — each in classify-only mode against a per-window
+**snapshot** of the records map — while the main process remains the single
+writer and replays every window **in history order**: classified NO_VULN
+commits are finalized with no second session, and everything else (VULN
+candidates, classify failures, rename/delete and record-hint commits) gets a
+full record session against the live records map. The snapshot is slightly
+stale by design; that is safe because fix detection (Pass B) reads the diff,
+not the records — staleness can only cost a duplicate record later, never a
+false NO_VULN, and duplicates collapse in the record phase. Window size
+(default 32, `parallel.window`) bounds the staleness; K workers + 1 record
+session are in flight at most. Expected speedup at 12–15% VULN commits and
+K=6–8: ~3–4x (the ceiling is the serialized record tape).
+
 A failed commit (LLM outage, timeout, validation error) rolls the baseline back to its
 parent and is requeued automatically on the next run — nothing is ever silently skipped.
 
@@ -184,8 +199,15 @@ accepted. See `GUIDE.md` for the full semantics.
 --skip-list FILE     treat the commits listed in FILE as NO_VULN (one hash per line)
 --record-hints       with --reuse-verdicts: reconsideration round feeding the prior
                      run's record content back on a NO_VULN flip
---in-place           checkout in the source clone instead of a worktree
---no-commit          don't git-commit this run
+  --in-place           checkout in the source clone instead of a worktree
+  --parallel [K]       classify-ahead: K workers (default 4, config
+                       parallel.workers) pre-classify windows of commits
+                       (config parallel.window, default 32) in classify-only
+                       mode against a records snapshot; the main process
+                       replays each window in history order — classified
+                       NO_VULN commits are final, the rest get full record
+                       sessions (~3–4x on large histories; worktree mode only)
+  --no-commit          don't git-commit this run
 --stop-on-fail       halt on the first failed commit (default: roll the baseline
                      back to the parent, requeue next run, continue)
 --model M            override the model (or export VULN_MODEL)

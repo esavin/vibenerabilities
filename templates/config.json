@@ -64,6 +64,12 @@
 
   "run_timeout_seconds": 0,
 
+  "parallel": {
+    "$comment": "R1 speedup for large histories (run.sh --parallel [K]): K workers classify windows of commits ahead in --classify-only mode against a per-window snapshot of the records map; the main process replays each window IN HISTORY ORDER - a classification NO_VULN is final (pure function of the commit), everything else (VULN candidates, classify failures, rename/delete and record-hint commits) gets a full record session as the only writer. workers: K default when --parallel is given without a number (the flag itself enables parallelism). window: commits per classify window - the staleness bound of the records snapshot (a stale map can only cause duplicate records, which collapse in the record phase); smaller W = fresher records but less classify-ahead overlap. Suggested: K=4..8, window >= 4*K, K*window within your gateway's rate budget. Needs worktree mode.",
+    "workers": 4,
+    "window": 32
+  },
+
   "auto_commit": true,
   "git_author_name": "vibenerabilities",
   "git_author_email": "vibenerabilities@local",

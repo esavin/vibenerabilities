@@ -222,6 +222,31 @@ silently lost their INDEX.md row; all of it is mechanically checkable:
   function of the commit (diff + message + model) — it never depends on the records
   map or earlier outcomes. Delete `verdicts/triage/` to reset the cache (also after
   changing `triage.diff_chars` or the model).
+- **Parallel classify-ahead** (`--parallel [K]`, worktree mode only): a `NO_VULN`
+  verdict is a pure function of the commit (the `--reuse-verdicts` contract), so it
+  can be computed *ahead* of the ordered records tape. K workers (default 4, or
+  config `parallel.workers`) each run classify-only sessions over a window of
+  `parallel.window` commits (default 32; `--parallel-window W` overrides) against a
+  per-window **snapshot** of the records map; the main process — the only writer —
+  then replays the window in history order: classified NO_VULN commits are finalized
+  with no second session, everything else gets a full record session against the live
+  records map. The next window's classification overlaps the current window's replay
+  (K classify workers + 1 record session in flight at most).
+  Safety: the records snapshot is stale by up to the window, which is fine because
+  fix detection (Pass B) reads the *diff*, not the records — staleness can only cost
+  a duplicate record later (collapsed by the record phase's read-before-write
+  matcher), never a false NO_VULN. Rename/delete commits, prior-run hint commits
+  (`--record-hints`), preseeded/regex skips and root commits skip classification
+  entirely and go straight to the record phase. A classify ERROR or crash falls back
+  to a record session, so a worker failure never loses a commit.
+  Semantics of the other flags are unchanged: `--limit` bounds replayed commits,
+  `--stop-on-fail` halts on a record-session failure, `--dry-run` classifies with no
+  side effects at all. Interrupt-safe: killed workers' worktrees are swept on exit,
+  the baseline only ever advances in the replay, and un-replayed classification is
+  simply redone next run. Watch live classification with `tail -f walk.log`
+  (`CLASSIFY` lines). Expected speedup at 12–15% VULN commits with K=6–8: ~3–4x —
+  the ceiling is the serialized VULN tape (0.15 × N × ~250s), so raise K only while
+  classify lines still dominate `walk.log`.
 - **Provider context-limit persistence** (automatic): the first session that hits a
   context-overflow HTTP 400 persists the provider-reported window to
   `verdicts/provider-limit.json`; every later session seeds its compaction threshold

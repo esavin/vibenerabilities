@@ -131,7 +131,9 @@ def verdict_line(verdict, records_root, records_root_rel):
 
 
 def write_atomic(path, text):
-    tmp = path + ".tmp"
+    # pid-suffixed tmp so concurrent processes never clobber each other's
+    # in-flight temp file before the atomic replace
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(text)
     os.replace(tmp, path)

@@ -199,7 +199,9 @@ def save_triage_cache(cache_dir, sha, model, decision, reason, usage):
              "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
     try:
         os.makedirs(cache_dir, exist_ok=True)
-        tmp = triage_cache_path(cache_dir, sha) + ".tmp"
+        # pid-suffixed tmp: concurrent writers (classify workers + the
+        # prefetch worker) must not clobber each other's in-flight tmp file
+        tmp = "%s.%d.tmp" % (triage_cache_path(cache_dir, sha), os.getpid())
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(state, ensure_ascii=False) + "\n")
         os.replace(tmp, triage_cache_path(cache_dir, sha))
