@@ -373,9 +373,9 @@ config / by bootstrap).
 - `.vibe-trees/<short>/` — disposable worktrees.
 
 ## The agent (vuln_agent/)
-`vibenerabilities/vuln_agent/` — Python package, stdlib-only (urllib for HTTP):
+`vibenerabilities/vuln_agent/` — Python package, stdlib-only (`http.client` for HTTP, keep-alive):
 - `cli.py` — argument parsing, verdict artifacts (written atomically), validation wiring.
-- `llm.py` — OpenAI-compatible HTTP client with retries and heartbeat.
+- `llm.py` — OpenAI-compatible HTTP client with retries, heartbeat and a persistent (keep-alive) connection.
 - `tools.py` — the seven tools with **code-level guards**: git restricted to
   `show|log|diff|ls-tree|grep` (scrubbed `GIT_*` env, no pager, forbidden flags like
   `-c`/`--output`/`--git-dir` rejected), reads confined to the worktree and records

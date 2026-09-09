@@ -134,8 +134,17 @@ triage-level NO_VULN, либо полный NO_VULN с reconsider-раундом
 Плюс проверить стоимость validate/hub на больших картах.
 
 ### R5. Мелочи без риска
-- HTTP keep-alive в `llm.py` (сейчас urllib = новый TCP+TLS на каждый запрос;
-  stdlib `http.client` с переиспользованием соединения; ~2% wall, бесплатно).
+- HTTP keep-alive в `llm.py`  [РЕАЛИЗОВАНО]
+  > Реализовано: транспорт `vuln_agent/llm.py` переведён с urllib (новый
+  > TCP+TLS на каждый запрос) на stdlib `http.client` с переиспользованием
+  > HTTP/1.1-соединения между round-trip'ами сессии. Протухший idle-сокет
+  > (сервер закрыл его между запросами) пересоздаётся один раз, не тратя
+  > retry-бюджет; при `Connection: close` от сервера соединение честно
+  > закрывается. Env-прокси как в urllib (http_proxy/https_proxy/no_proxy,
+  > для https — CONNECT-туннель), семантика ретраев/backoff/Retry-After и
+  > ContextOverflowError не изменились. Проверено smoke-тестом против
+  > локального сервера (reuse порта, stale-reconnect, close, 400-overflow,
+  > 429+Retry-After, прокси).
 - `triage.model` на дешёвый/быстрый инстанс — триаж в 3–5× быстрее.
 - Подсказка `--snapshot` в заголовке прогона при total > N (GUIDE уже
   рекомендует snapshot-first для больших историй).

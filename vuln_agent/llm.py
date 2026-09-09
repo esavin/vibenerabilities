@@ -1,16 +1,22 @@
-"""OpenAI-compatible chat-completions client over stdlib urllib.
+"""OpenAI-compatible chat-completions client over stdlib http.client.
 
 Non-streaming by design: the agent is headless and single-request-per-step, so a
-plain POST with retries is all that is needed. Swapping this module for the
-`openai` SDK later would not affect the rest of the package.
+plain POST with retries is all that is needed. The HTTP/1.1 connection is KEPT
+ALIVE across requests (one TCP/TLS handshake per session instead of one per
+round-trip); an idle socket the server has since closed is transparently
+re-established once before the retry budget is touched. Env proxies
+(http_proxy/https_proxy/no_proxy, CONNECT tunnel for https) behave as with
+urllib. Swapping this module for the `openai` SDK later would not affect the
+rest of the package.
 """
 
+import http.client
 import json
 import random
 import re
 import threading
 import time
-import urllib.error
+import urllib.parse
 import urllib.request
 
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
@@ -269,6 +275,119 @@ class ChatClient(object):
         self.max_tokens = max_tokens
         self.extra_body = dict(extra_body or {})
         self.heartbeat_seconds = max(0, int(heartbeat_seconds or 0))
+        parts = urllib.parse.urlsplit(self.url)
+        self._scheme = parts.scheme or "https"
+        self._host = parts.hostname or ""
+        self._port = parts.port
+        self._path = parts.path or "/"
+        if parts.query:
+            self._path += "?" + parts.query
+        self._headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "vuln-agent/1.0",
+            "Connection": "keep-alive",
+        }
+        self._proxy = self._proxy_for()
+        self._conn = None
+        self._conn_lock = threading.Lock()
+
+    # -- transport: one persistent keep-alive connection ---------------------
+
+    def _proxy_for(self):
+        """(host, port) of the env proxy for this endpoint, or None.
+
+        Keeps parity with urllib's env-proxy behaviour: http_proxy/
+        https_proxy/no_proxy are honoured; https goes through the proxy as a
+        CONNECT tunnel (so keep-alive spans the tunnelled TCP pipe).
+        """
+        if not self._host or urllib.request.proxy_bypass(self._host):
+            return None
+        proxies = urllib.request.getproxies()
+        proxy = proxies.get("https" if self._scheme == "https" else "http")
+        if not proxy:
+            return None
+        parts = urllib.parse.urlsplit(proxy)
+        if not parts.hostname:
+            return None
+        return parts.hostname, parts.port
+
+    def _open_connection(self):
+        if self._proxy is None:
+            return self._new_connection(self._host, self._port)
+        conn = self._new_connection(self._proxy[0], self._proxy[1])
+        if self._scheme == "https":
+            conn.set_tunnel(self._host, self._port)
+        return conn
+
+    def _new_connection(self, host, port):
+        if self._scheme == "https":
+            return http.client.HTTPSConnection(host, port, timeout=self.timeout)
+        return http.client.HTTPConnection(host, port, timeout=self.timeout)
+
+    def _drop_connection(self):
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def close(self):
+        """Drop the persistent connection (optional; reconnects on demand)."""
+        with self._conn_lock:
+            self._drop_connection()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def _send(self, body):
+        """One POST over the persistent (keep-alive) connection.
+
+        Returns (status, headers, raw_body_bytes). An idle keep-alive socket
+        the server closed between requests fails before any response bytes
+        arrive; that stale-connection case is retried once on a fresh
+        connection WITHOUT consuming a retry attempt. A failure after the
+        response started is never silently resent - it propagates to
+        chat()'s backoff loop (same semantics as the old one-shot urllib
+        transport).
+        """
+        headers = dict(self._headers)
+        if self.api_key:
+            headers["Authorization"] = "Bearer " + self.api_key
+        # plain-http through a proxy needs the absolute-form request line
+        target = self.url if (self._proxy and self._scheme != "https") \
+            else self._path
+        with self._conn_lock:
+            reused = self._conn is not None
+            while True:
+                if self._conn is None:
+                    self._conn = self._open_connection()
+                    reused = False
+                try:
+                    self._conn.request("POST", target, body=body,
+                                       headers=headers)
+                    response = self._conn.getresponse()
+                except (http.client.HTTPException, ConnectionError,
+                        TimeoutError, OSError):
+                    self._drop_connection()
+                    if reused:
+                        _log("keep-alive socket closed by server - "
+                             "reconnecting")
+                        continue
+                    raise
+                reused = False
+                try:
+                    data = response.read()
+                except (http.client.HTTPException, OSError):
+                    self._drop_connection()
+                    raise
+                if response.will_close:
+                    self._drop_connection()
+                return response.status, response.headers, data
 
     # -- public -------------------------------------------------------------
 
@@ -279,41 +398,30 @@ class ChatClient(object):
 
         last_error = None
         for attempt in range(self.retries + 1):
-            request = urllib.request.Request(
-                self.url,
-                data=body,
-                method="POST",
-                headers={
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "User-Agent": "vuln-agent/1.0",
-                },
-            )
-            if self.api_key:
-                request.add_header("Authorization", "Bearer " + self.api_key)
             try:
-                with _Heartbeat(self.model, self.heartbeat_seconds), \
-                        urllib.request.urlopen(request, timeout=self.timeout) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                return self._parse(data)
-            except urllib.error.HTTPError as exc:
-                detail = exc.read()[:400].decode("utf-8", "replace")
-                if exc.code == 400 and _is_context_overflow(detail):
-                    raise ContextOverflowError(
-                        "HTTP 400 from %s: %s" % (self.url, detail),
-                        _context_limit(detail))
-                if exc.code in RETRYABLE_HTTP and attempt < self.retries:
-                    last_error = "HTTP %d: %s" % (exc.code, detail)
-                    delay = self._backoff(attempt,
-                                          exc.headers.get("Retry-After"),
-                                          http=True)
-                    _log("HTTP %d from %s - retry %d/%d in %.0fs"
-                         % (exc.code, self.model, attempt + 1, self.retries,
-                            delay))
-                    time.sleep(delay)
-                    continue
-                raise FatalLLMError("HTTP %d from %s: %s" % (exc.code, self.url, detail))
-            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+                with _Heartbeat(self.model, self.heartbeat_seconds):
+                    status, headers, raw = self._send(body)
+                if status >= 400:
+                    detail = raw[:400].decode("utf-8", "replace")
+                    if status == 400 and _is_context_overflow(detail):
+                        raise ContextOverflowError(
+                            "HTTP 400 from %s: %s" % (self.url, detail),
+                            _context_limit(detail))
+                    if status in RETRYABLE_HTTP and attempt < self.retries:
+                        last_error = "HTTP %d: %s" % (status, detail)
+                        delay = self._backoff(attempt,
+                                              headers.get("Retry-After"),
+                                              http=True)
+                        _log("HTTP %d from %s - retry %d/%d in %.0fs"
+                             % (status, self.model, attempt + 1,
+                                self.retries, delay))
+                        time.sleep(delay)
+                        continue
+                    raise FatalLLMError(
+                        "HTTP %d from %s: %s" % (status, self.url, detail))
+                return self._parse(json.loads(raw.decode("utf-8")))
+            except (http.client.HTTPException, ConnectionError, TimeoutError,
+                    OSError) as exc:
                 if attempt < self.retries:
                     last_error = "connection error: %s" % exc
                     delay = self._backoff(attempt, None)
@@ -321,7 +429,8 @@ class ChatClient(object):
                          % (exc, attempt + 1, self.retries, delay))
                     time.sleep(delay)
                     continue
-                raise FatalLLMError("connection error (retries exhausted): %s" % exc)
+                raise FatalLLMError(
+                    "connection error (retries exhausted): %s" % exc)
             except json.JSONDecodeError as exc:
                 if attempt < self.retries:
                     last_error = "invalid JSON response: %s" % exc
