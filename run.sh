@@ -229,6 +229,44 @@ commit_baseline_if_dirty() { # <short>
   gitw commit -q -m "vulns(${PROJECT}): baseline @${1}" || true
 }
 
+# Walk-log annotation for freshly-CREATED records. The verdict line says
+# VULN_UPDATED both when a record is merely edited and when it is born at this
+# step. A record born at commit F whose "Introduced in" cites EARLIER commits
+# was missed by forward analysis and recovered retroactively from the fix
+# (Detection: retroactive-from-fix) — surface that in the log so the
+# introduction point is visible without opening the record. Must run BEFORE
+# commit_records stages the files (untracked "??" is the newness signal).
+new_record_notes() { # <verdict-line> <short> <sha> -> annotation lines ("" if none)
+  local verdict="$1" short="$2" sha="$3" files f st intro full shorts retro
+  files="${verdict#VERDICT: VULN_UPDATED}"
+  local IFS=','
+  for f in $files; do
+    f="${f#"${f%%[![:space:]]*}"}"; f="${f%"${f##*[![:space:]]}"}"   # trim spaces
+    case "$f" in *vulnerabilities/*.md) ;; *) continue ;; esac
+    st="$(gitw status --porcelain -- "$f" 2>/dev/null || true)"
+    case "$st" in '??'*) ;; *) continue ;; esac
+    intro="$(sed -n '/^### Introduced in/,/^### /p' "$WORK_DIR/$f" 2>/dev/null \
+             | grep -oE 'commit `[0-9a-f]{7,40}`' \
+             | sed 's/^commit `//; s/`$//' | sort -u || true)"
+    if [ -z "$intro" ]; then
+      printf '%s\n' "${PTAG}[$short]    new record ${f##*/}"
+      continue
+    fi
+    shorts=""; retro=0
+    while IFS= read -r full; do
+      [ -n "$full" ] || continue
+      if [ "$full" != "$sha" ]; then retro=1; fi
+      shorts="${shorts:+$shorts,}${full:0:7}"
+    done <<<$intro
+    if [ "$retro" = 1 ]; then
+      printf '%s\n' "${PTAG}[$short]    new record ${f##*/} (introduced $shorts — found retroactively at this commit)"
+    else
+      printf '%s\n' "${PTAG}[$short]    new record ${f##*/} (introduced by this commit)"
+    fi
+  done
+  return 0
+}
+
 # ---- git helpers on the source clone ----
 g() { git -C "$SOURCE_DIR" "$@"; }
 load_meta() { # <sha...>
@@ -321,7 +359,7 @@ prog_pos() { # <sha> -> "N/M"
 
 # ---- run one commit ----
 run_one() { # <sha>
-  local sha="$1" short subject path args verdict rc kind parent=""
+  local sha="$1" short subject path args verdict rc kind parent="" newnotes=""
   short="${SHORT[$sha]}"; subject="${SUBJ[$sha]}"
 
   if [[ -v CACHED_SKIP["$sha"] ]]; then
@@ -397,7 +435,8 @@ run_one() { # <sha>
   fi
 
   case "$kind" in
-    updated) sync_set_baseline "$sha"
+    updated) newnotes="$(new_record_notes "$verdict" "$short" "$sha" || true)"
+             sync_set_baseline "$sha"
              save_progress --arg b "$sha" '.processed += [$b] | .updated += 1'; commit_records "$short" "$subject";;
     clean)   sync_set_baseline "$sha"
              save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1';;
@@ -409,6 +448,7 @@ run_one() { # <sha>
               echo "${PTAG}[$short]    analyze: logs/$sha.log  $( [ -f "$VERDICTS/$sha.transcript.jsonl" ] && echo "verdicts/$sha.transcript.jsonl (python3 -m vuln_agent.transcript <file>)" )";;
   esac
   echo "${PTAG}[$short] -> $kind ($verdict)"
+  if [ -n "$newnotes" ]; then printf '%s\n' "$newnotes"; fi
 }
 
 # ---- CLI ----

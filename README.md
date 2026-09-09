@@ -112,6 +112,13 @@ history, `832` the total with the current walk filters — so after any interrup
 restart the numbering continues where it stopped, and you always see how much is done
 and how much remains.
 
+When a step creates a *new* record, an extra line flags it — `new record
+VULN-NNN-<slug>.md (introduced …)` — and says `found retroactively at this commit`
+when the record was recovered from a fix while its `Introduced in` cites earlier
+commits (Detection: retroactive-from-fix). A vulnerability the forward pass missed
+is therefore visible in the walk log at the commit where the pipeline learned of
+it, together with its real introduction point — not only inside the record file.
+
 ## Restart after upstream changes
 
 The last fully-processed commit is stored (committed) in
