@@ -43,13 +43,16 @@
   },
 
   "triage": {
-    "$comment": "Fast pre-filter (two-stage cascade) for large histories. When enabled, each commit first gets ONE cheap no-tools request (subject + message + name-status + the COMPLETE diff when it fits diff_chars) that must answer CLEARLY_IRRELEVANT before the commit is marked NO_VULN without a full session; SECURITY_RELEVANT, doubt, unparsable replies, or any guard (root commit, renames/deletes, fix/security keywords in the message, prior-run hints, diff over the cap) falls through to the FULL session, so recall is preserved. model: '' = llm.model - point it at a cheaper/faster model when the endpoint has one. irrelevant_globs: when EVERY changed file matches a glob, skip with NO LLM call at all (docs/tests/assets); empty disables. Measured effect on a 634-commit walk: multi-step NO_VULN sessions dominated ~57% of total wall time.",
+    "$comment": "Fast pre-filter (two-stage cascade) for large histories. When enabled, each commit first gets ONE cheap no-tools request (subject + message + name-status + the COMPLETE diff when it fits diff_chars) that must answer CLEARLY_IRRELEVANT before the commit is marked NO_VULN without a full session; SECURITY_RELEVANT or any doubt/parse failure/guard (root commit, renames/deletes, Pass-B keywords in the message, prior-run hints, diff over the cap) falls through to the FULL session, so recall is preserved. model: '' = llm.model - point it at a cheaper/faster model if the endpoint has one. irrelevant_globs: when EVERY changed file matches, skip with NO LLM call at all (docs/tests/assets); empty disables. prefetch_ahead: run.sh starts a background worker keeping triage decisions cached this many commits AHEAD of the walk (verdicts/triage/<sha>.json), so the cascade costs the main invocation zero LLM round-trips. Measured effect on a 634-commit walk: multi-step NO_VULN sessions dominated ~57% of total wall time.",
     "enabled": false,
     "model": "",
     "diff_chars": 16000,
     "message_chars": 2000,
     "name_status_chars": 6000,
-    "irrelevant_globs": []
+    "irrelevant_globs": [],
+    "prefetch_ahead": 0,
+    "prefetch_interval_seconds": 5,
+    "prefetch_max_idle_seconds": 900
   },
 
   "validation": {

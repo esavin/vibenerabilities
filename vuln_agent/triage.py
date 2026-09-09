@@ -31,9 +31,11 @@ NO_VULN with no LLM call at all. Off by default (empty list).
 """
 
 import fnmatch
+import json
 import os
 import re
 import subprocess
+import time
 
 TRIAGE_SYSTEM = """You are a fast pre-filter of a commit-by-commit security-analysis \
 pipeline. For each commit you decide whether a full analysis session (an agent \
@@ -142,15 +144,76 @@ def build_triage_user(subject, message, name_status, diff):
     return "\n".join(parts)
 
 
+def triage_cache_path(cache_dir, sha):
+    return os.path.join(cache_dir, sha + ".json") if cache_dir else ""
+
+
+def load_triage_cache(cache_dir, sha, model=""):
+    """Cached LLM triage decision for a commit, or None.
+
+    The decision is a pure function of (commit, model, diff cap), so it can be
+    computed AHEAD of the walk by a prefetch worker (vuln_agent.prefetch) and
+    replayed here with zero LLM calls. Guards (root/renames/keywords/...) are
+    NOT cached - they are local and re-derived every time.
+    """
+    path = triage_cache_path(cache_dir, sha)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        if state.get("sha") != sha or state.get("decision") not in ("skip",
+                                                                   "analyze"):
+            return None
+        if model and state.get("model") and state.get("model") != model:
+            return None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return state
+
+
+def save_triage_cache(cache_dir, sha, model, decision, reason, usage):
+    if not cache_dir:
+        return
+    state = {"sha": sha, "model": model, "decision": decision,
+             "via": "llm", "reason": reason,
+             "usage": {"prompt_tokens": int((usage or {}).get("prompt_tokens")
+                                            or 0),
+                       "completion_tokens": int((usage or {})
+                                                .get("completion_tokens")
+                                                or 0),
+                       "total_tokens": int((usage or {}).get("total_tokens")
+                                           or 0)},
+             "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp = triage_cache_path(cache_dir, sha) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(state, ensure_ascii=False) + "\n")
+        os.replace(tmp, triage_cache_path(cache_dir, sha))
+    except (OSError, ValueError):
+        pass
+
+
 def run_triage(client, worktree, sha, cfg, log,
                root_commit=False, old_paths=None, changed=0,
-               limits=None, transcript=None, model="", base_url=""):
+               limits=None, transcript=None, model="", base_url="",
+               cache_dir=None):
     """Decide skip-vs-analyze for one commit.
 
     Returns a NO_VULN verdict dict when the commit may skip the full session,
     or None when the full session must run. Never raises: any failure falls
     back to the full session (the caller's retry/requeue semantics then apply
     there, exactly as before triage existed).
+
+    `worktree` may be the WORKTREE at this commit (main invocation) or simply
+    the source repository - every git call here is object-database plumbing
+    (log/rev-parse/diff against explicit shas), so no checkout is needed.
+    That is what lets a prefetch worker triage FUTURE commits directly
+    against the clone while the walk is still elsewhere.
+
+    `cache_dir` (optional): verdicts/triage - LLM decisions are cached per
+    sha and reused across invocations (pure function of commit + model).
     """
     lim = limits if isinstance(limits, dict) else {}
     diff_cap = int(cfg.get("diff_chars") or 0)
@@ -162,23 +225,31 @@ def run_triage(client, worktree, sha, cfg, log,
         log("triage: full session (%s)" % reason)
         return None
 
-    if root_commit:
-        return refuse("root commit - initial snapshot scan")
-    if changed <= 0:
-        return refuse("empty name-status")
-    if old_paths:
-        return refuse("renames/deletes present (path hygiene / fix removal)")
-
     parent = _git(worktree, ["rev-parse", "--verify", "--quiet",
                              sha + "^"]).strip()
+    if root_commit or (root_commit is None and not parent):
+        return refuse("root commit - initial snapshot scan")
     if not parent:
         return refuse("no parent found")
     ns_raw = _git(worktree, ["diff", "--name-status", "-M", parent, sha])
     files = []
+    ns_old_paths = []
     for line in ns_raw.splitlines():
         parts = line.split("\t")
         if len(parts) >= 2:
             files.append(parts[-1])
+            if parts[0].startswith("R") and len(parts) >= 3:
+                ns_old_paths.append(parts[1])
+            elif parts[0].startswith("D"):
+                ns_old_paths.append(parts[1])
+    if old_paths is None:
+        old_paths = ns_old_paths
+    if not changed:
+        changed = len(files)
+    if changed <= 0:
+        return refuse("empty name-status")
+    if old_paths:
+        return refuse("renames/deletes present (path hygiene / fix removal)")
 
     # local glob fast path BEFORE the keyword guard: an explicitly configured
     # irrelevant_globs match is a deliberate opt-in for docs/tests/assets-only
@@ -210,6 +281,37 @@ def run_triage(client, worktree, sha, cfg, log,
         return refuse("diff (%d chars) over triage cap (%d)"
                       % (len(diff), diff_cap))
 
+    # cached decision (usually written ahead by the prefetch worker while the
+    # walk was still on an earlier commit): replay with zero LLM calls
+    cached = load_triage_cache(cache_dir, sha, model=model)
+    if cached is not None:
+        usage = cached.get("usage") or {}
+        if cached["decision"] != "skip":
+            if transcript is not None:
+                transcript.record({"type": "triage", "decision": "analyze",
+                                   "via": "cache",
+                                   "reason": cached.get("reason"),
+                                   "model": model, "sha": sha})
+            return refuse("cached decision: SECURITY_RELEVANT")
+        reason = cached.get("reason") or \
+            "cascade pre-filter: CLEARLY_IRRELEVANT (diff seen in full)"
+        log("triage: skip (cached: %s)" % reason)
+        if transcript is not None:
+            transcript.record({"type": "triage", "decision": "skip",
+                               "via": "cache", "reason": reason,
+                               "model": model, "sha": sha,
+                               "usage": usage})
+            transcript.record({"type": "end", "verdict": "NO_VULN",
+                               "reason": "triage: %s (cached)" % reason})
+        return {"verdict": "NO_VULN", "files": [],
+                "reason": "triage: %s (cached)" % reason, "steps": 1,
+                "usage": {"prompt_tokens": int(usage.get("prompt_tokens")
+                                               or 0),
+                          "completion_tokens": int(usage.get(
+                              "completion_tokens") or 0),
+                          "total_tokens": int(usage.get("total_tokens") or 0)},
+                "sessions": 1}
+
     user = build_triage_user(subject, _cap(message, message_cap),
                              _cap(ns_raw, ns_cap), diff)
     try:
@@ -222,10 +324,11 @@ def run_triage(client, worktree, sha, cfg, log,
     reply = str((response.get("message") or {}).get("content") or "")
     usage = response.get("usage") or {}
     decision = parse_decision(reply)
+    reason = "cascade pre-filter: CLEARLY_IRRELEVANT (diff seen in full)"
+    save_triage_cache(cache_dir, sha, model, decision, reason, usage)
     if decision != "skip":
         return refuse("model answered SECURITY_RELEVANT/doubted")
 
-    reason = "cascade pre-filter: CLEARLY_IRRELEVANT (diff seen in full)"
     log("triage: skip (%s)" % reason)
     if transcript is not None:
         transcript.record({

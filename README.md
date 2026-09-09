@@ -113,7 +113,11 @@ Everything else falls through to the full three-pass session: fix/security
 keywords in the message, any rename/deletion, root commits, oversized diffs,
 prior-run hints, doubt, or an unparsable/failed reply. With
 `triage.irrelevant_globs`, commits whose every changed file matches
-(docs/tests/assets style globs) skip with no LLM call at all. On a measured
+(docs/tests/assets style globs) skip with no LLM call at all. With
+`triage.prefetch_ahead: 3`, run.sh keeps a background worker caching triage
+decisions a few commits ahead of the walk (`verdicts/triage/`), so the
+cascade costs the main invocation zero LLM round-trips — safe because the
+decision is a pure function of the commit. On a measured
 634-commit walk, multi-step NO_VULN sessions dominated ~57% of wall time — the
 cascade turns those into one small request while preserving recall guardrails.
 The agent also persists a provider-reported context window

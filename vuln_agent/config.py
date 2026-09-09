@@ -105,6 +105,12 @@ TRIAGE_DEFAULTS = {
     # when EVERY changed file matches one of these globs, skip with no LLM
     # call at all (e.g. ["docs/**", "**/*_test.go", "*.md", "assets/**"])
     "irrelevant_globs": [],
+    # background triage prefetch (run.sh starts vuln_agent.prefetch when > 0):
+    # keep triage decisions cached AHEAD of the walk so the cascade decision
+    # costs the main invocation zero LLM round-trips
+    "prefetch_ahead": 0,
+    "prefetch_interval_seconds": 5,
+    "prefetch_max_idle_seconds": 900,
 }
 
 
@@ -261,7 +267,9 @@ def resolve_triage(config, llm):
     if not isinstance(enabled, bool):
         enabled = str(enabled).strip().lower() in ("true", "1", "yes", "on")
     numbers = {}
-    for key in ("diff_chars", "message_chars", "name_status_chars"):
+    for key in ("diff_chars", "message_chars", "name_status_chars",
+                "prefetch_ahead", "prefetch_interval_seconds",
+                "prefetch_max_idle_seconds"):
         try:
             numbers[key] = max(0, int(merged[key]))
         except (TypeError, ValueError):

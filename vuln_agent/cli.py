@@ -363,7 +363,8 @@ def main(argv=None):
                 triage_client, worktree, args.sha, triage, log,
                 root_commit=root_commit, old_paths=old_paths,
                 changed=changed, limits=limits, transcript=transcript,
-                model=triage["model"], base_url=llm["base_url"])
+                model=triage["model"], base_url=llm["base_url"],
+                cache_dir=os.path.join(args.verdicts_dir, "triage"))
 
         if triage_skip is not None:
             session_verdicts = [triage_skip]

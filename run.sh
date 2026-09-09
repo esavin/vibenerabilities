@@ -314,6 +314,7 @@ free_tree() { # <path>
 # ---- cleanup on exit / interrupt: free any in-flight worktree, prune ----
 cleanup() {
   if [ -n "${CUR_TREE:-}" ]; then free_tree "$CUR_TREE" 2>/dev/null || true; CUR_TREE=""; fi
+  [ -n "${PREFETCH_PID:-}" ] && kill "$PREFETCH_PID" 2>/dev/null || true
   [ -n "${SOURCE_DIR:-}" ] && git -C "$SOURCE_DIR" worktree prune 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -669,6 +670,22 @@ fi
   echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} todo=$QUEUE_TOTAL total=$PROG_TOTAL worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N record_hints=$([ "$RECORD_HINTS" = 1 ] && echo "$PRIOR_REC_N" || echo 0)"
 } | tee -a "$WALK_LOG"
 
+# ---- triage prefetch worker (config triage.enabled + triage.prefetch_ahead) ----
+# Background loop that keeps triage decisions cached AHEAD of the walk (pure
+# git plumbing against the source clone, no worktrees, no records access), so
+# the cascade decision inside each agent invocation costs zero LLM round-trips.
+PREFETCH_PID=""
+if [ "$(jq -r '.triage.enabled // false' "$CONFIG")" = "true" ]; then
+  PREFETCH_AHEAD="$(jq -r '.triage.prefetch_ahead // 0' "$CONFIG")"
+  if [ "$PREFETCH_AHEAD" -gt 0 ] 2>/dev/null; then
+    python3 -m vuln_agent.prefetch --config "$CONFIG" --source "$SOURCE_DIR" \
+      --verdicts-dir "$VERDICTS" --records-root "$RECORDS_ROOT" \
+      --ahead "$PREFETCH_AHEAD" > "$RUN_LOGS/prefetch.log" 2>&1 &
+    PREFETCH_PID=$!
+    echo "triage prefetch: ahead=$PREFETCH_AHEAD pid=$PREFETCH_PID (logs/prefetch.log)" | tee -a "$WALK_LOG"
+  fi
+fi
+
 count=0; last_short=""
 for sha in "${SHAS[@]}"; do
   [[ -v PROC["$sha"] ]] && continue
@@ -677,6 +694,14 @@ for sha in "${SHAS[@]}"; do
   PTAG="[$(prog_pos "$sha")] "
   run_one "$sha" 2>&1 | tee -a "$WALK_LOG"
 done
+
+# stop the prefetch worker before the summary: the walk is done, further triage
+# calls would only bill the endpoint for decisions nobody will read
+if [ -n "${PREFETCH_PID:-}" ]; then
+  kill "$PREFETCH_PID" 2>/dev/null || true
+  wait "$PREFETCH_PID" 2>/dev/null || true
+  PREFETCH_PID=""
+fi
 
 # persist any trailing baseline advance that wasn't captured by a record commit
 commit_baseline_if_dirty "${last_short:-none}"

@@ -208,6 +208,14 @@ silently lost their INDEX.md row; all of it is mechanically checkable:
   LLM call at all. Measured on a 634-commit walk with a wandering model: multi-step
   NO_VULN sessions were ~57% of total wall time (~9h of 15.4h) at ~111s mean per
   commit — the cascade replaces most of those with one ~700-token request.
+- **Triage prefetch** (`triage.prefetch_ahead: 3`): run.sh then starts a background
+  worker (`vuln_agent.prefetch`, log in `logs/prefetch.log`) that keeps triage
+  decisions cached this many commits ahead of the walk (`verdicts/triage/<sha>.json`),
+  so the cascade decision costs the main invocation zero LLM round-trips and its
+  latency hides behind the running full session. Safe because the decision is a pure
+  function of the commit (diff + message + model) — it never depends on the records
+  map or earlier outcomes. Delete `verdicts/triage/` to reset the cache (also after
+  changing `triage.diff_chars` or the model).
 - **Provider context-limit persistence** (automatic): the first session that hits a
   context-overflow HTTP 400 persists the provider-reported window to
   `verdicts/provider-limit.json`; every later session seeds its compaction threshold
