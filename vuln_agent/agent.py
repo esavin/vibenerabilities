@@ -62,10 +62,13 @@ Weak-model guardrails observed on real runs (fernflower):
 """
 
 import json
+import os
+import time
 
 from .llm import ContextOverflowError
 
 MAX_TOOL_RESULT_CHARS = 100_000
+PROVIDER_LIMIT_FILE = "provider-limit.json"
 REPAIR_EXTRA_STEPS = 6
 WRITE_EXTRA_STEPS = 6
 WRITE_EXTENSIONS = 2
@@ -229,9 +232,54 @@ def _overflow_shrink(messages, attempt, keep_groups, result_chars):
     return before - after, shrunk
 
 
+def save_provider_limit(path, limit, model="", base_url=""):
+    """Persist a provider-reported input-token window for FUTURE sessions.
+
+    Each session starts with a fresh context, so without this file every
+    session on a window-limited gateway pays at least one context-overflow
+    HTTP 400 before its compaction threshold adapts. Write failures are
+    never fatal.
+    """
+    if not path or not limit:
+        return
+    state = {"input_limit": int(limit), "model": model,
+             "base_url": base_url, "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(state) + "\n")
+        os.replace(tmp, path)
+    except (OSError, ValueError):
+        pass
+
+
+def load_provider_limit(path, model="", base_url=""):
+    """Read a persisted provider window; None when absent or stale.
+
+    A stored window is only honored while `model` and `base_url` still match -
+    switching to a bigger-window model must not keep the old, smaller seed.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        limit = int(state.get("input_limit") or 0)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if limit <= 0:
+        return None
+    if model and state.get("model") and state.get("model") != model:
+        return None
+    if base_url and state.get("base_url") and state.get("base_url") != base_url:
+        return None
+    return limit
+
+
 def run_agent(client, tools, system_prompt, first_user, max_steps, log,
               validator=None, repair_rounds=0, transcript=None, reconsider=None,
-              limits=None):
+              limits=None, limit_state_path=None):
     """Run the loop. Returns a verdict dict: {verdict, files, reason, steps, usage}.
 
     `reconsider` (optional) is called exactly once, after the model finishes
@@ -245,6 +293,11 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
     `limits` (optional, from config `limits` / resolve_limits) carries the
     per-result cap and the compaction knobs; the defaults reproduce the
     historical constants with compaction off.
+
+    `limit_state_path` (optional): when the provider reports its context
+    window in a context-overflow 400, the discovered limit is persisted there
+    (see save_provider_limit) so later sessions can seed their compaction
+    threshold instead of re-discovering it the hard way.
     """
     lim = limits if isinstance(limits, dict) else {}
     tool_result_cap = max(2000, int(lim.get("tool_result_chars")
@@ -335,6 +388,13 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                 # compact early enough that growth never reaches the window
                 # again (0.82 of the provider limit leaves headroom for the
                 # reply and the tool schemas the gateway also counts)
+                if exc.limit:
+                    url = getattr(client, "url", "")
+                    if url.endswith("/chat/completions"):
+                        url = url[: -len("/chat/completions")]
+                    save_provider_limit(limit_state_path, exc.limit,
+                                        model=getattr(client, "model", ""),
+                                        base_url=url)
                 target = 0
                 if exc.limit:
                     target = max(1000, int(exc.limit * 0.82))

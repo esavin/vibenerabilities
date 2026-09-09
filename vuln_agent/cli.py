@@ -24,14 +24,16 @@ import json
 import os
 import sys
 
-from .agent import run_agent
-from .config import ConfigError, load_config, resolve_llm, resolve_limits
+from .agent import (PROVIDER_LIMIT_FILE, load_provider_limit, run_agent)
+from .config import (ConfigError, load_config, resolve_llm, resolve_limits,
+                     resolve_triage)
 from .hygiene import hygiene_plan
 from .llm import ChatClient, FatalLLMError
 from .prompt import (InspectError, build_first_user, build_reconsider_message,
                      load_prior_hint, sha_looks_valid, system_prompt)
 from .tools import ToolSet
 from .transcript import Transcript
+from .triage import run_triage
 from .validate import format_report, repair_message, validate_records
 
 
@@ -147,9 +149,27 @@ def main(argv=None):
         llm = resolve_llm(config, cli_model=args.model or None,
                           cli_max_steps=args.max_steps or None)
         limits = resolve_limits(config)
+        triage = resolve_triage(config, llm)
     except ConfigError as exc:
         print("vuln-agent: %s" % exc, file=sys.stderr)
         return 2
+
+    # seed the compaction threshold from a provider limit discovered by an
+    # EARLIER session (verdicts/provider-limit.json): each session otherwise
+    # re-pays one context-overflow HTTP 400 before adapting. Only applies
+    # while compaction is otherwise off - an explicit
+    # limits.compact_threshold_tokens always wins, and the stored window is
+    # ignored once model/endpoint change.
+    limit_state_path = os.path.join(args.verdicts_dir, PROVIDER_LIMIT_FILE)
+    if not limits.get("compact_threshold_tokens"):
+        known = load_provider_limit(limit_state_path, model=llm["model"],
+                                    base_url=llm["base_url"])
+        if known:
+            limits["compact_threshold_tokens"] = max(1000, int(known * 0.82))
+            log("compaction threshold seeded to %d tokens from persisted "
+                "provider limit %d (%s)"
+                % (limits["compact_threshold_tokens"], known,
+                   PROVIDER_LIMIT_FILE))
 
     records_root = os.path.realpath(args.records_root)
     worktree = os.path.realpath(args.worktree)
@@ -319,63 +339,98 @@ def main(argv=None):
                 record.update(extra)
             transcript.record(record)
 
-        record_session()
-        session_verdicts = []
-        wrote_records = False
-        try:
-            # path-hygiene batches: one fresh, small session per batch of the
-            # repair worklist (giant single sessions blow the context window)
-            for index, batch in enumerate(batches):
-                batch_records = tuple(sorted(batch))
-                focus_user, _info = build_first_user(
-                    args.sha, worktree, records_root, mode, today,
-                    read_conventions(records_root, limits), limits=limits,
-                    focus={"batch": index + 1, "batches": len(batches),
-                           "stale": batch})
-                batch_tools = ToolSet(worktree, records_root,
-                                      classify_only=args.classify_only,
-                                      limits=limits)
-                record_session({"batch": "%d/%d" % (index + 1, len(batches)),
-                                "focus_records": list(batch_records),
-                                "first_user_chars": len(focus_user),
-                                "max_steps": llm["max_steps"]})
-                log("hygiene batch %d/%d: %s" % (index + 1, len(batches),
-                                                 ", ".join(batch_records)))
-                session_verdicts.append(run_agent(
-                    client, batch_tools, sys_prompt, focus_user,
-                    llm["max_steps"], log,
-                    validator=lambda records=batch_records: validator(records),
-                    repair_rounds=val_rounds, transcript=transcript,
-                    limits=limits))
-                wrote_records = wrote_records or batch_tools.wrote_records
+        # triage fast-path (config triage.enabled): ONE cheap no-tools
+        # request (or a pure local glob match) may mark the commit NO_VULN
+        # without the full session. Every guard - root commit, renames/
+        # deletes, hygiene worklist, prior-run hint, fix/security keywords,
+        # oversized diff, unparsable reply - falls through to the FULL
+        # session below, so recall is preserved.
+        triage_skip = None
+        if (triage["enabled"] and reconsider is None
+                and not batches
+                and not (plan and (plan["prepass_edited"]
+                                   or plan["stale_by_record"]))):
+            triage_client = client
+            if triage["model"] != llm["model"]:
+                triage_client = ChatClient(
+                    base_url=llm["base_url"], api_key=llm["api_key"],
+                    model=triage["model"], timeout=llm["timeout"],
+                    retries=llm["retries"], temperature=llm["temperature"],
+                    max_tokens=llm["max_tokens"],
+                    extra_body=llm["extra_body"],
+                    heartbeat_seconds=llm["heartbeat_seconds"])
+            triage_skip = run_triage(
+                triage_client, worktree, args.sha, triage, log,
+                root_commit=root_commit, old_paths=old_paths,
+                changed=changed, limits=limits, transcript=transcript,
+                model=triage["model"], base_url=llm["base_url"])
 
-            # main session: classification as usual. After batches the
-            # records changed, so the first message is rebuilt (its
-            # stale-records worklist must reflect the post-repair state, not
-            # the old one).
-            if batches:
-                first_user, _info = build_first_user(
-                    args.sha, worktree, records_root, mode, today,
-                    read_conventions(records_root, limits), limits=limits)
-            verdict = run_agent(client, tools, sys_prompt, first_user,
-                                max_steps, log,
-                                validator=validator, repair_rounds=val_rounds,
-                                transcript=transcript, reconsider=reconsider,
-                                limits=limits)
-            session_verdicts.append(verdict)
-            wrote_records = wrote_records or tools.wrote_records
-        except FatalLLMError as exc:
-            verdict = {"verdict": "ERROR", "files": [], "reason":
-                       "llm: %s" % exc, "steps": 0,
-                       "usage": {"prompt_tokens": 0, "completion_tokens": 0,
-                                 "total_tokens": 0}}
-            session_verdicts.append(verdict)
-            if transcript is not None:
-                transcript.record({"type": "end", "verdict": "ERROR",
-                                   "reason": verdict["reason"]})
-        finally:
+        if triage_skip is not None:
+            session_verdicts = [triage_skip]
+            wrote_records = False
+            verdict = triage_skip
             if transcript is not None:
                 transcript.close()
+        else:
+            record_session()
+            session_verdicts = []
+            wrote_records = False
+            try:
+                # path-hygiene batches: one fresh, small session per batch of
+                # the repair worklist (giant single sessions blow the context
+                # window)
+                for index, batch in enumerate(batches):
+                    batch_records = tuple(sorted(batch))
+                    focus_user, _info = build_first_user(
+                        args.sha, worktree, records_root, mode, today,
+                        read_conventions(records_root, limits), limits=limits,
+                        focus={"batch": index + 1, "batches": len(batches),
+                               "stale": batch})
+                    batch_tools = ToolSet(worktree, records_root,
+                                          classify_only=args.classify_only,
+                                          limits=limits)
+                    record_session({"batch": "%d/%d" % (index + 1, len(batches)),
+                                    "focus_records": list(batch_records),
+                                    "first_user_chars": len(focus_user),
+                                    "max_steps": llm["max_steps"]})
+                    log("hygiene batch %d/%d: %s" % (index + 1, len(batches),
+                                                     ", ".join(batch_records)))
+                    session_verdicts.append(run_agent(
+                        client, batch_tools, sys_prompt, focus_user,
+                        llm["max_steps"], log,
+                        validator=lambda records=batch_records: validator(records),
+                        repair_rounds=val_rounds, transcript=transcript,
+                        limits=limits, limit_state_path=limit_state_path))
+                    wrote_records = wrote_records or batch_tools.wrote_records
+
+                # main session: classification as usual. After batches the
+                # records changed, so the first message is rebuilt (its
+                # stale-records worklist must reflect the post-repair state,
+                # not the old one).
+                if batches:
+                    first_user, _info = build_first_user(
+                        args.sha, worktree, records_root, mode, today,
+                        read_conventions(records_root, limits), limits=limits)
+                verdict = run_agent(client, tools, sys_prompt, first_user,
+                                    max_steps, log,
+                                    validator=validator, repair_rounds=val_rounds,
+                                    transcript=transcript, reconsider=reconsider,
+                                    limits=limits,
+                                    limit_state_path=limit_state_path)
+                session_verdicts.append(verdict)
+                wrote_records = wrote_records or tools.wrote_records
+            except FatalLLMError as exc:
+                verdict = {"verdict": "ERROR", "files": [], "reason":
+                           "llm: %s" % exc, "steps": 0,
+                           "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                                     "total_tokens": 0}}
+                session_verdicts.append(verdict)
+                if transcript is not None:
+                    transcript.record({"type": "end", "verdict": "ERROR",
+                                       "reason": verdict["reason"]})
+            finally:
+                if transcript is not None:
+                    transcript.close()
 
         # aggregate the pre-pass + every session into ONE commit verdict
         prepass_edited = (plan or {}).get("prepass_edited") or {}

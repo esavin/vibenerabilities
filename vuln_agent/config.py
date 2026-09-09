@@ -93,6 +93,21 @@ SNAPSHOT_DEFAULTS = {
 }
 
 
+# Triage fast-path (two-stage cascade, see vuln_agent/triage.py). Off by
+# default: the classic behavior is one full session per commit.
+TRIAGE_DEFAULTS = {
+    "enabled": False,
+    # "" = llm.model; point at a cheaper/faster model if the endpoint has one
+    "model": "",
+    "diff_chars": 16_000,
+    "message_chars": 2_000,
+    "name_status_chars": 6_000,
+    # when EVERY changed file matches one of these globs, skip with no LLM
+    # call at all (e.g. ["docs/**", "**/*_test.go", "*.md", "assets/**"])
+    "irrelevant_globs": [],
+}
+
+
 class ConfigError(Exception):
     """Fatal misconfiguration — the agent cannot start."""
 
@@ -233,3 +248,31 @@ def resolve_snapshot(config, llm):
         "max_modules": max_modules,
         "max_steps": max_steps,
     }
+
+
+def resolve_triage(config, llm):
+    """Merge the `triage` section (fast-path cascade) over the llm settings."""
+    section = config.get("triage")
+    if not isinstance(section, dict):
+        section = {}
+    merged = dict(TRIAGE_DEFAULTS)
+    merged.update({k: v for k, v in section.items() if v not in (None, "")})
+    enabled = merged["enabled"]
+    if not isinstance(enabled, bool):
+        enabled = str(enabled).strip().lower() in ("true", "1", "yes", "on")
+    numbers = {}
+    for key in ("diff_chars", "message_chars", "name_status_chars"):
+        try:
+            numbers[key] = max(0, int(merged[key]))
+        except (TypeError, ValueError):
+            raise ConfigError("triage.%s must be an integer" % key)
+    globs = merged["irrelevant_globs"]
+    if not isinstance(globs, (list, tuple)):
+        raise ConfigError("triage.irrelevant_globs must be a list of globs")
+    resolved = {
+        "enabled": enabled,
+        "model": str(merged["model"] or llm["model"]),
+        "irrelevant_globs": [str(g) for g in globs],
+    }
+    resolved.update(numbers)
+    return resolved

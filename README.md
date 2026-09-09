@@ -105,6 +105,22 @@ Each `VULN-NNN-*.md` record contains:
    duplicate rows for the same record dropped — and
    **git-commits** the record changes (`vulns(<project>): <subject>`).
 
+**Optional triage cascade** (`triage.*` in config, off by default): each commit
+first gets ONE cheap no-tools request — subject, full message, name-status and
+the COMPLETE diff whenever it fits `triage.diff_chars` — and only a confident
+`CLEARLY_IRRELEVANT` answer marks the commit NO_VULN without a full session.
+Everything else falls through to the full three-pass session: fix/security
+keywords in the message, any rename/deletion, root commits, oversized diffs,
+prior-run hints, doubt, or an unparsable/failed reply. With
+`triage.irrelevant_globs`, commits whose every changed file matches
+(docs/tests/assets style globs) skip with no LLM call at all. On a measured
+634-commit walk, multi-step NO_VULN sessions dominated ~57% of wall time — the
+cascade turns those into one small request while preserving recall guardrails.
+The agent also persists a provider-reported context window
+(`verdicts/provider-limit.json`) after the first context-overflow HTTP 400, so
+later sessions seed their compaction threshold instead of re-discovering the
+limit the hard way.
+
 A failed commit (LLM outage, timeout, validation error) rolls the baseline back to its
 parent and is requeued automatically on the next run — nothing is ever silently skipped.
 

@@ -197,6 +197,30 @@ silently lost their INDEX.md row; all of it is mechanically checkable:
 ## Performance / cost
 - Because **every** commit is analyzed, large repos mean many agent calls. `--limit N`
   bounds a run; combine with automatic resume for overnight batches.
+- **Triage cascade for long walks** (`"triage": {"enabled": true}`): each commit first
+  gets ONE cheap no-tools request (subject + message + name-status + the complete diff
+  when it fits `triage.diff_chars`); only a confident `CLEARLY_IRRELEVANT` answer marks
+  the commit NO_VULN without a full session. Recall guardrails: fix/security-keyword
+  messages, renames/deletes, root commits, oversized diffs, prior-run hints, doubt and
+  failed/unparsable replies all fall through to the FULL session. `triage.model` can
+  point at a cheaper/faster model; `triage.irrelevant_globs` (e.g.
+  `["docs/**", "**/*_test.go", "*.md", "assets/**"]`) skips matching commits with no
+  LLM call at all. Measured on a 634-commit walk with a wandering model: multi-step
+  NO_VULN sessions were ~57% of total wall time (~9h of 15.4h) at ~111s mean per
+  commit — the cascade replaces most of those with one ~700-token request.
+- **Provider context-limit persistence** (automatic): the first session that hits a
+  context-overflow HTTP 400 persists the provider-reported window to
+  `verdicts/provider-limit.json`; every later session seeds its compaction threshold
+  from it (0.82 × window) instead of paying its own overflow round-trip first. The
+  stored window is ignored once `llm.model`/`llm.base_url` change, and an explicit
+  `limits.compact_threshold_tokens` always wins. Delete the file to re-learn.
+- **Completion tokens are wall-clock time**: on reasoning models most latency is token
+  generation, so the system prompt pins a response-economy contract (no narration
+  between tool calls, terse `finish` reasons). If your endpoint accepts
+  `extra_body` (e.g. vLLM's `chat_template_kwargs: {"enable_thinking": false}` on
+  Qwen-style models), disabling visible/hidden thinking where quality allows is the
+  single biggest latency lever — on the measured walk ~37% of generated tokens never
+  surfaced as content or tool arguments.
 - **Snapshot first for big histories**: `--snapshot` scans the current tree in
   (modules + 1) sessions; replay is then only ever needed for NEW commits. See
   "Snapshot deep-scan instead of full replay".

@@ -36,10 +36,20 @@
   },
 
   "snapshot": {
-    "$comment": "Snapshot deep-scan (run.sh --snapshot [REF]): scan the CURRENT tree at REF (default HEAD) for pre-existing vulnerabilities instead of replaying history - one planner request partitions the tree into modules, then one agent session per module scans it. The baseline jumps to REF; later runs analyze only newer commits. planner_model: model for the one planner request ('' = llm.model). max_modules: cap on the module partition (excess merges into 'misc'). max_steps: per-module session step budget (0 = llm.max_steps_initial).",
+    "$comment": "Snapshot deep-scan (run.sh --snapshot [REF]): scan the CURRENT tree at REF (default HEAD) for pre-existing vulnerabilities instead of replaying history - one planner request partitions the tree into modules, then one agent session per module scans it. The baseline jumps to REF; later runs analyze only NEW commits. planner_model: model for the one planner request ('' = llm.model). max_modules: cap on the module partition (excess merges into 'misc'). max_steps: per-module session step budget (0 = llm.max_steps_initial).",
     "planner_model": "",
     "max_modules": 40,
     "max_steps": 0
+  },
+
+  "triage": {
+    "$comment": "Fast pre-filter (two-stage cascade) for large histories. When enabled, each commit first gets ONE cheap no-tools request (subject + message + name-status + the COMPLETE diff when it fits diff_chars) that must answer CLEARLY_IRRELEVANT before the commit is marked NO_VULN without a full session; SECURITY_RELEVANT, doubt, unparsable replies, or any guard (root commit, renames/deletes, fix/security keywords in the message, prior-run hints, diff over the cap) falls through to the FULL session, so recall is preserved. model: '' = llm.model - point it at a cheaper/faster model when the endpoint has one. irrelevant_globs: when EVERY changed file matches a glob, skip with NO LLM call at all (docs/tests/assets); empty disables. Measured effect on a 634-commit walk: multi-step NO_VULN sessions dominated ~57% of total wall time.",
+    "enabled": false,
+    "model": "",
+    "diff_chars": 16000,
+    "message_chars": 2000,
+    "name_status_chars": 6000,
+    "irrelevant_globs": []
   },
 
   "validation": {

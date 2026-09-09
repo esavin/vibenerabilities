@@ -88,6 +88,16 @@ with a workspace folder like agent/project/. Repeated exploration near the \
 step limit is cut off: watch the step counter in tool results and call \
 finish in time.
 
+# Response economy (latency-critical)
+- Between tool calls, reply with the tool calls ONLY: no narration, no \
+markdown analysis in message content - the pipeline consumes tool calls and \
+the final finish, nothing else, and every generated token is wall-clock time.
+- finish(reason) is at most 3 sentences.
+- When the FULL DIFF is present and shows no security-relevant change \
+(documentation, comments, tests, formatting, assets, pure UI cosmetics), call \
+finish (NO_VULN) IMMEDIATELY - do not read worktree files to double-confirm \
+irrelevance.
+
 # Pass A - Introduced in this commit (forward analysis)
 Examine every hunk of the diff. Flag INTRODUCTION when the added/modified \
 lines exhibit any baseline dangerous pattern:
