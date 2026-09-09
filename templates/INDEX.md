@@ -25,7 +25,9 @@ By severity (open / total):
 ## Findings
 
 <!-- One row per VULN-NNN. Update Status when a fix commit is recorded.
-     Sort by severity (Critical first), then by ID. -->
+     Rows are kept sorted by VULN ID by the pipeline - append new rows at
+     the end of the table; EDIT an existing row instead of adding a second
+     one for the same ID. -->
 
 | ID | Title | Severity | Status | Introduced | Fixed | Record |
 | --- | --- | --- | --- | --- | --- | --- |

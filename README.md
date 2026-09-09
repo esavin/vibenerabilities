@@ -100,7 +100,9 @@ Each `VULN-NNN-*.md` record contains:
 6. `run.sh` reads the first line of `verdicts/<sha>.txt` (`VERDICT: VULN_UPDATED <files>`
    / `VERDICT: NO_VULN` / `VERDICT: ERROR <reason>`), advances the committed baseline
    (`agent/project/.vibenerabilities.json`), rewrites `INDEX.md`'s Sync Status and
-   reconciles the Findings table deterministically (`vuln_agent/hub.py`), and
+   reconciles the Findings table deterministically (`vuln_agent/hub.py`) —
+   coverage repair plus a stable sort of the data rows by VULN ID, with
+   duplicate rows for the same record dropped — and
    **git-commits** the record changes (`vulns(<project>): <subject>`).
 
 A failed commit (LLM outage, timeout, validation error) rolls the baseline back to its

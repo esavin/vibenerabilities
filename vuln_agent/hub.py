@@ -18,8 +18,18 @@ LLM-drift failure modes maintained by the pipeline, not by the model:
   docs linked). After every processed commit the pipeline now re-adds a row
   for every record the table no longer lists and drops rows whose record
   file vanished. Cells of SURVIVING rows are never touched: the agent
-  maintains them (severity ordering, status flips, refined titles) and the
-  mechanical pass must not overwrite that work.
+  maintains them (status flips, refined titles) and the mechanical pass
+  must not overwrite that work.
+- findings-row order: the agent inserts rows wherever it is working in the
+  table (a real run had VULN-015 between VULN-004 and VULN-005, plus
+  duplicate rows for the same record - a second full-SHA row appended
+  instead of editing the existing one). Row ORDER is pipeline-owned state,
+  like Sync Status: after every processed commit the data rows are
+  permuted into ascending VULN-number order (stable; a row's cell content
+  is still the agent's), duplicate rows for the same number are dropped
+  (first occurrence wins - it is the older, agent-maintained row), and
+  VULN data rows stranded OUTSIDE the Findings section (a real run left
+  two after the Sync Status block) are removed as drift.
 - dropped navigation sections: an agent rewrite of the hub can delete a
   whole section heading (a real run lost "## Function Documentation" in the
   root commit and every later capability doc then landed in design/). The
@@ -78,7 +88,9 @@ _SUMMARY_BLOCK = [
 ]
 _FINDINGS_COMMENT = [
     "<!-- One row per VULN-NNN. Update Status when a fix commit is recorded.",
-    "     Sort by severity (Critical first), then by ID. -->",
+    "     Rows are kept sorted by VULN ID by the pipeline - append new rows at",
+    "     the end of the table; EDIT an existing row instead of adding a",
+    "     second one for the same ID. -->",
 ]
 _TABLE_HEADER = [
     "| ID | Title | Severity | Status | Introduced | Fixed | Record |",
@@ -296,12 +308,53 @@ def _pop_section_tail(out):
     return tail
 
 
+def _sort_findings_rows(rows):
+    """Deterministic order for the Findings table's data rows: permute them
+    (among their own slots) into ascending VULN-number order - stable, so
+    rows for the same number keep their relative order - and drop duplicate
+    rows for a number already listed (first occurrence wins: it is the
+    older, agent-maintained row). Header/placeholder/non-table lines keep
+    their positions untouched. Returns (duplicates_dropped, rows_moved)."""
+    slots = []   # index of every VULN data row, first-occurrence only
+    dupes_at = []  # indices of duplicate rows (same number seen before)
+    kept = []    # (number, line) for those first occurrences
+    seen = set()
+    for index, line in enumerate(rows):
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        match = _VULN_ID_RE.match(cells[0]) if cells else None
+        if not match:
+            continue
+        number = int(match.group(1))
+        if number in seen:
+            dupes_at.append(index)
+            continue
+        seen.add(number)
+        slots.append(index)
+        kept.append((number, line))
+    if not slots:
+        return 0, 0
+    moved = 0
+    for slot, (_number, line) in zip(slots, sorted(kept,
+                                                   key=lambda pair: pair[0])):
+        if rows[slot] != line:
+            rows[slot] = line
+            moved += 1
+    for index in reversed(dupes_at):
+        del rows[index]
+    return len(dupes_at), moved
+
+
 def _reconcile_findings_table(lines, span, records):
     """Tier 1 of the heal: the '## Findings' table covers every record file.
     Rows whose VULN id has no record file are dropped, a canonical row is
-    appended for every record the table does not list yet, and rows of
-    SURVIVING records are never touched - the agent maintains their cells.
-    Returns (rows_added, rows_dropped)."""
+    appended for every record the table does not list yet, rows of
+    SURVIVING records are never touched - the agent maintains their cells -
+    and the data rows are permuted into ascending VULN-number order
+    (duplicate rows for the same number are dropped; see
+    _sort_findings_rows). Returns (rows_added, rows_dropped, rows_duped,
+    rows_moved)."""
     start, end = span
     by_number = {record["number"]: record for record in records}
     seen = set()
@@ -361,8 +414,9 @@ def _reconcile_findings_table(lines, span, records):
             insert_at = offset + 1
         if not alive and not placeholder and insert_at is not None:
             out.insert(insert_at, _PLACEHOLDER_ROW)
+    dupes, moved = _sort_findings_rows(out)
     lines[start:end] = out
-    return len(missing), dropped
+    return len(missing), dropped, dupes, moved
 
 
 def _reconcile_design_notes(lines, span, designs, records_root):
@@ -424,12 +478,13 @@ def _anchor_for(lines, keys):
 
 def reconcile_navigation(records_root):
     """Guarantee navigation coverage: the '## Findings' table covers every
-    vulnerabilities/ record (rows added/dropped mechanically, surviving rows
-    never touched), the Aggregated Design Notes section covers every design/
-    note, and a navigation section whose heading the agent dropped entirely
-    is re-created from the canonical template (anchored above the Aggregated
-    Design Notes / Sync Status sections). Returns a one-line change summary,
-    '' when everything is already complete."""
+    vulnerabilities/ record (rows added/dropped mechanically, surviving
+    rows' cells never touched - but the data rows are kept sorted by VULN
+    number, duplicates dropped), the Aggregated Design Notes section covers
+    every design/ note, and a navigation section whose heading the agent
+    dropped entirely is re-created from the canonical template (anchored
+    above the Aggregated Design Notes / Sync Status sections). Returns a
+    one-line change summary, '' when everything is already complete."""
     hub_path = os.path.join(records_root, HUB)
     lines = _read_lines(hub_path)
     skeleton = lines is None
@@ -440,13 +495,15 @@ def reconcile_navigation(records_root):
     records = _vuln_records(records_root)
     designs = _design_docs(records_root)
 
-    rows_added = rows_dropped = links_added = links_dropped = 0
+    rows_added = rows_dropped = rows_duped = rows_moved = 0
+    links_added = links_dropped = 0
     created = []
 
     # Tier 1 - heal the existing sections row by row
     span = _section_span(lines, "finding")
     if span is not None:
-        rows_added, rows_dropped = _reconcile_findings_table(lines, span, records)
+        rows_added, rows_dropped, rows_duped, rows_moved = \
+            _reconcile_findings_table(lines, span, records)
     span = _section_span(lines, "design")
     if span is not None:
         links_added, links_dropped = _reconcile_design_notes(
@@ -487,18 +544,51 @@ def reconcile_navigation(records_root):
         for i in order:
             lines[resolved[i]:resolved[i]] = blocks[i][1]
 
+    # Tier 3 - a VULN data row outside the Findings section is agent drift
+    # (a real run left two rows appended after the Sync Status block): the
+    # section's own table is the single source of truth, so such orphans
+    # are dropped wherever they landed
+    in_findings = False
+    protected = set()
+    for index, line in enumerate(lines):
+        match = _HEADING_RE.match(line)
+        if match:
+            in_findings = "finding" in match.group(1).lower()
+            continue
+        if in_findings:
+            protected.add(index)
+    orphans = 0
+    if len(protected) < len(lines):
+        kept_lines = []
+        for index, line in enumerate(lines):
+            if index not in protected and line.lstrip().startswith("|"):
+                cells = [cell.strip()
+                         for cell in line.strip().strip("|").split("|")]
+                if cells and _VULN_ID_RE.match(cells[0]):
+                    orphans += 1
+                    continue
+            kept_lines.append(line)
+        lines[:] = kept_lines
+
     summary_parts = []
     if skeleton:
         summary_parts.append("created missing INDEX.md (skeleton)")
     if rows_added or rows_dropped:
         summary_parts.append("findings rows: %+d, -%d dead"
                              % (rows_added, rows_dropped))
+    if rows_duped:
+        summary_parts.append("-%d duplicate row(s)" % rows_duped)
+    if rows_moved:
+        summary_parts.append("rows sorted by ID (%d moved)" % rows_moved)
+    if orphans:
+        summary_parts.append("-%d orphaned row(s) outside ## Findings"
+                             % orphans)
     if links_added or links_dropped:
         summary_parts.append("design links: %+d, -%d dead"
                              % (links_added, links_dropped))
     if created:
         summary_parts.append("created section(s): %s" % ", ".join(created))
-    if lines != original:
+    if lines != original or skeleton:
         _write_lines(hub_path, lines)
     if not summary_parts:
         return ""

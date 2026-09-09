@@ -215,12 +215,15 @@ existing file instead).
 repository-root-relative paths, exactly as they exist in the worktree at the \
 relevant commit. Quote Evidence lines VERBATIM from the source at the \
 introducing commit.
-3. After ANY record change, refresh INDEX.md: add rows to the "## Findings" \
-table (| ID | Title | Severity | Status | Introduced | Fixed | Record |), \
-flip Status (Open -> Fixed) when a record's status changes, refresh the \
-"## Summary" counts (Total/Open/Fixed and per-severity open/total), and bump \
-"*Last updated:*". NEVER edit the "## Sync Status" block at the bottom of \
-INDEX.md - the pipeline maintains it deterministically.
+ 3. After ANY record change, refresh INDEX.md: append rows for NEW records \
+at the END of the "## Findings" table (| ID | Title | Severity | Status | \
+Introduced | Fixed | Record |) - row order is maintained by the pipeline, \
+and never add a second row for an ID the table already lists (edit that \
+row instead) - flip Status (Open -> Fixed) when a record's status changes, \
+refresh the "## Summary" counts (Total/Open/Fixed and per-severity \
+open/total), and bump "*Last updated:*". NEVER edit the "## Sync Status" \
+block at the bottom of INDEX.md - the pipeline maintains it \
+deterministically.
 4. In every file you modify: set *Last updated: <TODAY>* and *Areas: \
 <project>, <subsystem>, security* per the conventions file (always include \
 security).
@@ -992,8 +995,10 @@ your own); <slug> is a short kebab-case description of the issue.
 (snapshot scan) and "### Introduced in": "earlier - pre-existing at <ref> \
 (snapshot)". NEVER fabricate an introducing SHA - the exact origin is not \
 traced in snapshot mode.
-3. Refresh INDEX.md after each record: add its row to the "## Findings" \
-table (| ID | Title | Severity | Status | Introduced | Fixed | Record |), \
+3. Refresh INDEX.md after each record: append its row at the END of the \
+"## Findings" table (| ID | Title | Severity | Status | Introduced | Fixed \
+| Record |) - row order is maintained by the pipeline, and never add a \
+second row for an ID the table already lists (edit that row instead) - \
 refresh the "## Summary" counts (Total/Open/Fixed and per-severity \
 open/total), bump "*Last updated:*". NEVER edit the "## Sync Status" block \
 at the bottom of INDEX.md - the pipeline maintains it deterministically.

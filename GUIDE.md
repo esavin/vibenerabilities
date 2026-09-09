@@ -152,7 +152,11 @@ commit / last synced) — an external audit once found "(none)/(never)" in a ful
 project because the sync fields were left to the LLM. It also reconciles the **Findings
 table**: a row is re-added for every record the table no longer lists, rows whose record
 file vanished are dropped, and cells of surviving rows are never touched (the agent owns
-severity ordering, status flips, refined titles). A dropped section heading (`## Summary`
+status flips, refined titles). Row **order** is pipeline-owned: after every processed
+commit the data rows are permuted into ascending VULN-ID order (stable) and duplicate
+rows for the same record are dropped — the first occurrence wins, so the agent-maintained
+row survives. VULN rows stranded outside the `## Findings` section (e.g. appended after
+Sync Status) are removed as drift. A dropped section heading (`## Summary`
 / `## Findings`) is re-created from the canonical template. The Summary counts are
 deliberately NOT recomputed here — the validator reports drift and the agent repairs it
 (a silent recompute would mask an agent that stopped maintaining them).
