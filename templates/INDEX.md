@@ -27,7 +27,8 @@ By severity (open / total):
 <!-- One row per VULN-NNN. Update Status when a fix commit is recorded.
      Rows are kept sorted by VULN ID by the pipeline - append new rows at
      the end of the table; EDIT an existing row instead of adding a second
-     one for the same ID. -->
+     one for the same ID. Record cell: the bare record path
+     (vulnerabilities/VULN-NNN-<slug>.md) - no [id](link) markup. -->
 
 | ID | Title | Severity | Status | Introduced | Fixed | Record |
 | --- | --- | --- | --- | --- | --- | --- |

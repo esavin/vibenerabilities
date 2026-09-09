@@ -19,7 +19,11 @@ LLM-drift failure modes maintained by the pipeline, not by the model:
   for every record the table no longer lists and drops rows whose record
   file vanished. Cells of SURVIVING rows are never touched: the agent
   maintains them (status flips, refined titles) and the mechanical pass
-  must not overwrite that work.
+  must not overwrite that work. Sole exception: the last (Record) cell is
+  pure navigation state, so a legacy "[VULN-NNN](vulnerabilities/...)"
+  markdown link there is rewritten to the bare record path - the ID is
+  already column 1 and part of the filename, the link markup only spends
+  context tokens on every later read.
 - findings-row order: the agent inserts rows wherever it is working in the
   table (a real run had VULN-015 between VULN-004 and VULN-005, plus
   duplicate rows for the same record - a second full-SHA row appended
@@ -90,7 +94,8 @@ _FINDINGS_COMMENT = [
     "<!-- One row per VULN-NNN. Update Status when a fix commit is recorded.",
     "     Rows are kept sorted by VULN ID by the pipeline - append new rows at",
     "     the end of the table; EDIT an existing row instead of adding a",
-    "     second one for the same ID. -->",
+    "     second one for the same ID. Record cell: the bare record path",
+    "     (vulnerabilities/VULN-NNN-<slug>.md) - no [id](link) markup. -->",
 ]
 _TABLE_HEADER = [
     "| ID | Title | Severity | Status | Introduced | Fixed | Record |",
@@ -104,6 +109,13 @@ _DESIGN_COMMENT = [
 _HR_RE = re.compile(r"^-{3,}\s*$")
 _PLACEHOLDER_RE = re.compile(r"^_\(.*\)_$|^_To be populated\._$")
 _VULN_ID_RE = re.compile(r"^VULN-(\d+)$", re.IGNORECASE)
+# a Record cell still written as a markdown link ("[VULN-001](vulnerabilities/
+# VULN-001-x.md)") - the legacy row shape; rewritten to the bare path. Only
+# the LAST cell of a row matches (anchored at end of line), so links in other
+# columns or in prose are never touched.
+_ROW_LINK_RE = re.compile(
+    r"\[[^\]]*\]\(\s*<?(vulnerabilities/[A-Za-z0-9_./\-]+?\.md)>?"
+    r"\s*(?:\"[^\"]*\")?\s*\)\s*(\|)\s*$")
 
 
 def update_sync_status(records_root, baseline, label="", today=""):
@@ -251,11 +263,13 @@ def _design_docs(records_root):
 def _findings_row(record):
     """Canonical table row for one record: id, title, severity, status,
     Introduced/Fixed short SHAs ('-' when the record has none), Record cell
-    linking the file. Parse failures already degraded to 'Unknown'."""
+    with the bare records-root-relative path (NO markdown link - the ID is
+    already column 1 and part of the filename; link markup only spends
+    context tokens). Parse failures already degraded to 'Unknown'."""
     cells = [record["id"], record["title"] or "Unknown",
              record["severity"] or "Unknown", record["status"] or "Unknown",
              record["introduced"] or "-", record["fixed"] or "-",
-             "[%s](vulnerabilities/%s)" % (record["id"], record["file"])]
+             "vulnerabilities/%s" % record["file"]]
     return "| " + " | ".join(cell.replace("|", "/") for cell in cells) + " |"
 
 
@@ -350,11 +364,13 @@ def _reconcile_findings_table(lines, span, records):
     """Tier 1 of the heal: the '## Findings' table covers every record file.
     Rows whose VULN id has no record file are dropped, a canonical row is
     appended for every record the table does not list yet, rows of
-    SURVIVING records are never touched - the agent maintains their cells -
-    and the data rows are permuted into ascending VULN-number order
-    (duplicate rows for the same number are dropped; see
-    _sort_findings_rows). Returns (rows_added, rows_dropped, rows_duped,
-    rows_moved)."""
+    SURVIVING records keep their agent-maintained cells - except the last
+    (Record) cell, which is mechanical navigation state: a legacy
+    "[VULN-NNN](vulnerabilities/...)" link there is rewritten to the bare
+    path, saving context tokens on every later read - and the data rows are
+    permuted into ascending VULN-number order (duplicate rows for the same
+    number are dropped; see _sort_findings_rows). Returns (rows_added,
+    rows_dropped, rows_duped, rows_moved, cells_unlinked)."""
     start, end = span
     by_number = {record["number"]: record for record in records}
     seen = set()
@@ -369,6 +385,7 @@ def _reconcile_findings_table(lines, span, records):
     missing = [record for record in records if record["number"] not in seen]
     out = []
     dropped = 0
+    unlinked = 0
     for index in range(start, end):
         line = lines[index]
         if not line.lstrip().startswith("|"):
@@ -381,6 +398,11 @@ def _reconcile_findings_table(lines, span, records):
             continue  # the record file is gone - the row is dead
         if not match and missing and _PLACEHOLDER_RE.match(cells[0]):
             continue  # first real rows replace the template placeholder
+        if match:
+            plain = _ROW_LINK_RE.sub(r"\1 \2", line)
+            if plain != line:
+                unlinked += 1
+                line = plain
         out.append(line)
     if missing:
         rows = [_findings_row(record) for record in missing]
@@ -416,7 +438,7 @@ def _reconcile_findings_table(lines, span, records):
             out.insert(insert_at, _PLACEHOLDER_ROW)
     dupes, moved = _sort_findings_rows(out)
     lines[start:end] = out
-    return len(missing), dropped, dupes, moved
+    return len(missing), dropped, dupes, moved, unlinked
 
 
 def _reconcile_design_notes(lines, span, designs, records_root):
@@ -495,15 +517,15 @@ def reconcile_navigation(records_root):
     records = _vuln_records(records_root)
     designs = _design_docs(records_root)
 
-    rows_added = rows_dropped = rows_duped = rows_moved = 0
+    rows_added = rows_dropped = rows_duped = rows_moved = cells_unlinked = 0
     links_added = links_dropped = 0
     created = []
 
     # Tier 1 - heal the existing sections row by row
     span = _section_span(lines, "finding")
     if span is not None:
-        rows_added, rows_dropped, rows_duped, rows_moved = \
-            _reconcile_findings_table(lines, span, records)
+        (rows_added, rows_dropped, rows_duped, rows_moved,
+         cells_unlinked) = _reconcile_findings_table(lines, span, records)
     span = _section_span(lines, "design")
     if span is not None:
         links_added, links_dropped = _reconcile_design_notes(
@@ -580,6 +602,9 @@ def reconcile_navigation(records_root):
         summary_parts.append("-%d duplicate row(s)" % rows_duped)
     if rows_moved:
         summary_parts.append("rows sorted by ID (%d moved)" % rows_moved)
+    if cells_unlinked:
+        summary_parts.append("%d Record cell(s) rewritten to bare path"
+                             % cells_unlinked)
     if orphans:
         summary_parts.append("-%d orphaned row(s) outside ## Findings"
                              % orphans)

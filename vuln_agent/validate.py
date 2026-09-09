@@ -411,15 +411,18 @@ def check_stale(records_root, old_paths, errors):
 
 def check_orphans(records_root, warnings):
     """Reverse direction of check_links: navigation coverage. Every
-    vulnerabilities/ and design/ record must be reachable from INDEX.md. The
+    vulnerabilities/ and design/ record must be reachable from INDEX.md -
+    via a markdown link OR a bare records-root-relative path mention (the
+    Findings Record column carries the plain path, no link markup). The
     agent rewrites the hub per commit in a small context and old rows fall
     out (orphan drift); this reports the drift. Warnings only -
     vuln_agent/hub.py heals them."""
     hub = os.path.join(records_root, HUB)
     if not os.path.isfile(hub):
         return
+    text = _read(hub)
     linked = set()
-    for match in _LINK_RE.finditer(_read(hub)):
+    for match in _LINK_RE.finditer(text):
         target = match.group(2).strip()
         if not target or target.startswith(_SKIP_PREFIXES):
             continue
@@ -431,11 +434,13 @@ def check_orphans(records_root, warnings):
         linked.add(rel.replace(os.sep, "/"))
     for directory, names in records_inventory(records_root).items():
         for name in names:
-            if "%s/%s" % (directory, name) not in linked:
-                warnings.append(
-                    "%s/%s: not linked from INDEX.md (navigation coverage; "
-                    "the pipeline re-adds missing rows itself after this "
-                    "commit)" % (directory, name))
+            rel = "%s/%s" % (directory, name)
+            if rel in linked or rel in text:
+                continue
+            warnings.append(
+                "%s: not linked from INDEX.md (navigation coverage; "
+                "the pipeline re-adds missing rows itself after this "
+                "commit)" % rel)
 
 
 def check_hub_sections(records_root, errors):
