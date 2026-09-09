@@ -130,6 +130,33 @@ def _estimate_prompt_tokens(messages):
     return total // 4
 
 
+def _tail_estimate(messages, last_prompt_tokens):
+    """Projected prompt tokens of the NEXT request.
+
+    `last_prompt_tokens` is what the gateway REPORTED for the previous
+    request (real usage); everything appended after that response - the
+    assistant message, its tool results, injected nudges - is estimated at
+    ~3 chars per token (conservative for code/diff text; the chars/4 rule
+    underestimates right where it hurts). This is what lets the pre-flight
+    overflow guard see a single tool round that adds more tokens than the
+    headroom left in the provider window.
+    """
+    last_assistant = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "assistant":
+            last_assistant = index
+            break
+    tail = 0
+    for message in messages[max(last_assistant, 0):]:
+        content = message.get("content")
+        if isinstance(content, str):
+            tail += len(content)
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or call
+            tail += len(str(function.get("arguments") or ""))
+    return int(last_prompt_tokens or 0) + tail // 3
+
+
 def compact_history(messages, keep_groups, old_result_chars,
                     old_text_chars=400):
     """Downsample OLD assistant/tool groups in place (parity-safe).
@@ -324,6 +351,10 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
     shrunk_ids = set()   # tool_call_ids shrunk by compact_history so far
     last_prompt_tokens = 0
     compact_stalled = False  # last pass freed nothing; wait for new messages
+    # provider input-token window when KNOWN (limits.provider_input_limit
+    # seeded from the persisted provider-limit state, or a 400 mid-session);
+    # 0 = unknown, pre-flight overflow guard disabled
+    provider_limit = int(lim.get("provider_input_limit") or 0)
     finish_only = False   # grace mode: every tool except finish is refused
     grace_used = False
     reconsider_used = False
@@ -341,7 +372,7 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
         nonlocal budget, write_extensions, deadline_sent_at, finish_only
         nonlocal grace_used, step, empty_streak, text_streak, repairs_used
         nonlocal reconsider_used, last_prompt_tokens, compact_stalled
-        nonlocal compact_threshold
+        nonlocal compact_threshold, provider_limit
         step += 1
         if compact_threshold and last_prompt_tokens >= compact_threshold \
                 and not compact_stalled:
@@ -357,6 +388,38 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                         "results_shrunk": len(shrunk)})
             else:
                 compact_stalled = True  # everything already small; retry later
+        # pre-flight overflow guard: the compaction trigger above fires on
+        # tokens REPORTED by a previous response, so it cannot see a single
+        # tool round whose results add more than the headroom left in the
+        # provider window (measured: 3 read_file calls can append ~25k
+        # tokens at once). When the window is known - persisted provider
+        # limit seeded via limits.provider_input_limit, or a 400 earlier in
+        # THIS session - shrink proactively instead of paying the guaranteed
+        # 400 round-trip first. Same escalating ladder as the 400 recovery;
+        # if it cannot get under the ceiling, the request goes out anyway
+        # and the recovery path remains the final net.
+        if provider_limit:
+            ceiling = int(provider_limit * 0.95)
+            projected = _tail_estimate(messages, last_prompt_tokens)
+            guard_pass = 0
+            while projected >= ceiling and guard_pass < OVERFLOW_ATTEMPTS:
+                freed, ids = _overflow_shrink(messages, guard_pass,
+                                              compact_keep, compact_cap)
+                guard_pass += 1
+                if freed > 0:
+                    shrunk_ids.update(sid for sid in ids if sid)
+                    log("pre-flight overflow guard: projected %d tokens >= %d "
+                        "(95%% of window %d) - pass %d/%d freed ~%d chars "
+                        "before sending"
+                        % (projected, ceiling, provider_limit, guard_pass,
+                           OVERFLOW_ATTEMPTS, freed))
+                    record({"type": "preflight_overflow", "step": step,
+                            "pass": guard_pass, "chars_freed": freed,
+                            "projected_tokens": projected,
+                            "provider_limit": provider_limit})
+                    projected = _tail_estimate(messages, last_prompt_tokens)
+                # freed == 0: escalate to the next pass (same ladder as the
+                # 400 recovery - single-group sessions only yield at pass 2+)
         overflow_pass = 0
         while True:
             try:
@@ -389,6 +452,7 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                 # again (0.82 of the provider limit leaves headroom for the
                 # reply and the tool schemas the gateway also counts)
                 if exc.limit:
+                    provider_limit = int(exc.limit)
                     url = getattr(client, "url", "")
                     if url.endswith("/chat/completions"):
                         url = url[: -len("/chat/completions")]

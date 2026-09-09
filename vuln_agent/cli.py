@@ -166,6 +166,11 @@ def main(argv=None):
                                     base_url=llm["base_url"])
         if known:
             limits["compact_threshold_tokens"] = max(1000, int(known * 0.82))
+            # also expose the window itself: agent.py uses it for the
+            # pre-flight overflow guard (a single tool round can add more
+            # tokens than the headroom below the window - shrink before
+            # sending instead of paying the 400 round-trip first)
+            limits["provider_input_limit"] = known
             log("compaction threshold seeded to %d tokens from persisted "
                 "provider limit %d (%s)"
                 % (limits["compact_threshold_tokens"], known,
