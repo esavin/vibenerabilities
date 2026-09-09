@@ -54,11 +54,19 @@ Rules:
 hides a real vulnerability, a false SECURITY_RELEVANT only costs one session.
 - Answer with the single word line only; no explanation."""
 
-# Keep in sync with the Pass B trigger list in prompt.SYSTEM_PROMPT.
+# Keep in sync with the Pass B trigger list in prompt.SYSTEM_PROMPT, but
+# WORD-BOUNDARY anchored: the Pass B text match runs inside a full session
+# where a substring hit merely opens an extra detection pass, while here it
+# outright blocks the cheap path - "fix" inside "prefix"/"fixtures" must not
+# force a full session on a docs-only commit (measured: 14 of 36 guarded
+# commits on one stretch were substring-only false positives).
 _PASS_B_KEYWORDS = re.compile(
-    r"fix|security|vuln|cve-|cwe-|xss|csrf|ssrf|injection|traversal|sanitize"
-    r"|patch|hotfix|hardening|auth|privilege|disclosure|leak|rce|dos|bypass"
-    r"|overflow|forgery|hijack",
+    r"\b(fix(es|ed|ing)?|secur(e|ity)|vuln(erabilit(y|ies))?|cve-\d+"
+    r"|cwe-\d+|xss|csrf|ssrf|injection|traversal|sanitiz(e|es|ed|ation)"
+    r"|patch(es|ed)?|hotfix(es)?|hardening|auth(orize|orized|orizes"
+    r"|orization|enticate|enticated|enticates|entication)?"
+    r"|privileges?|disclosure|leaks?(ed|age)?|rce|dos|bypass(es|ed)?"
+    r"|overflows?(ed)?|forgery|hijack(ing|ed)?)\b",
     re.IGNORECASE,
 )
 
@@ -161,12 +169,6 @@ def run_triage(client, worktree, sha, cfg, log,
     if old_paths:
         return refuse("renames/deletes present (path hygiene / fix removal)")
 
-    subject = _git(worktree, ["log", "-1", "--format=%s", sha]).strip()
-    message = _git(worktree, ["log", "-1", "--format=%B", sha]).strip()
-
-    if _PASS_B_KEYWORDS.search(message or ""):
-        return refuse("commit message matches fix/security keywords")
-
     parent = _git(worktree, ["rev-parse", "--verify", "--quiet",
                              sha + "^"]).strip()
     if not parent:
@@ -178,6 +180,9 @@ def run_triage(client, worktree, sha, cfg, log,
         if len(parts) >= 2:
             files.append(parts[-1])
 
+    # local glob fast path BEFORE the keyword guard: an explicitly configured
+    # irrelevant_globs match is a deliberate opt-in for docs/tests/assets-only
+    # diffs, and must not be vetoed by a stray "fix" substring in the message
     if all_files_irrelevant(files, globs):
         reason = ("local fast path: all %d changed file(s) match "
                   "triage.irrelevant_globs" % len(files))
@@ -193,6 +198,12 @@ def run_triage(client, worktree, sha, cfg, log,
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0,
                           "total_tokens": 0},
                 "sessions": 1}
+
+    subject = _git(worktree, ["log", "-1", "--format=%s", sha]).strip()
+    message = _git(worktree, ["log", "-1", "--format=%B", sha]).strip()
+
+    if _PASS_B_KEYWORDS.search(message or ""):
+        return refuse("commit message matches fix/security keywords")
 
     diff = _git(worktree, ["diff", "-M", parent, sha]).strip("\n")
     if diff_cap <= 0 or len(diff) > diff_cap:
