@@ -65,6 +65,12 @@ declare -A CACHED_SKIP   # sha -> source <sha>.txt (abs path) | "list" — prese
 declare -A PRIOR_REC     # sha -> 1 — prior run flagged it (VULN_UPDATED verdict)
 PRESEEDED_N=0; PRIOR_REC_N=0   # scalars: ${#empty_assoc[@]} trips set -u on bash 5.2
 CUR_TREE=""
+# progress display: each processed commit is prefixed "[N/M]" — N = absolute
+# position of the commit in the project history (oldest = 1), M = total commits
+# with the same walk filters (skip_merges/scope). Absolute positions make the
+# counter stable across interruptions: restarting after 8 of 832 continues at
+# [9/832], so the user always sees how much is done and how much remains.
+PROG_TOTAL=0; QUEUE_TOTAL=0; QUEUE_POS=0; PTAG=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
@@ -295,6 +301,24 @@ regex_skips() { # <sha> <subject>
   ! has_rd_changes "$1"
 }
 
+# ---- progress numbering ----
+# "N/M" for a commit: absolute position within the project history (same walk
+# filters as the queue) when the commit is on HEAD's history — this is what
+# keeps the counter stable across interruptions and reruns; queue-relative
+# position as a fallback for commits outside HEAD (detached --sha/--range,
+# history rewritten upstream).
+prog_pos() { # <sha> -> "N/M"
+  local after=""
+  if [ "$PROG_TOTAL" -gt 0 ] && g merge-base --is-ancestor "$1" HEAD 2>/dev/null; then
+    after="$(g rev-list --count ${rln[@]+"${rln[@]}"} "$1..HEAD" ${sc[@]+"${sc[@]}"} 2>/dev/null || true)"
+  fi
+  if [[ "$after" =~ ^[0-9]+$ ]] && [ "$after" -lt "$PROG_TOTAL" ]; then
+    printf '%d/%d' "$((PROG_TOTAL - after))" "$PROG_TOTAL"
+  else
+    printf '%d/%d' "$QUEUE_POS" "$QUEUE_TOTAL"
+  fi
+}
+
 # ---- run one commit ----
 run_one() { # <sha>
   local sha="$1" short subject path args verdict rc kind parent=""
@@ -303,7 +327,7 @@ run_one() { # <sha>
   if [[ -v CACHED_SKIP["$sha"] ]]; then
     # preseeded NO_VULN (from --reuse-verdicts or --skip-list): replay it, no agent call
     local src="${CACHED_SKIP[$sha]}"
-    echo "[$short] CLEAN (preseeded)  $subject"
+    echo "${PTAG}[$short] CLEAN (preseeded)  $subject"
     if [[ "$src" != list ]]; then
       # copy the old verdict artifacts for traceability (skip if same verdicts dir)
       if [ "$(cd "$(dirname "$src")" && pwd)" != "$VERDICTS" ]; then
@@ -319,7 +343,7 @@ run_one() { # <sha>
   fi
 
   if regex_skips "$sha" "$subject"; then
-    echo "[$short] SKIP (regex)  $subject"
+    echo "${PTAG}[$short] SKIP (regex)  $subject"
     printf 'VERDICT: NO_VULN(regex)\n' > "$VERDICTS/$sha.txt"
     sync_set_baseline "$sha"
     save_progress --arg b "$sha" '.processed += [$b] | .skipped += 1'
@@ -339,7 +363,7 @@ run_one() { # <sha>
   fi
   local model="${OVERRIDE_MODEL:-$CFG_MODEL}"; [ -n "$model" ] && ag+=(--model "$model")
 
-  echo "[$short] ANALYZE       $subject"
+  echo "${PTAG}[$short] ANALYZE       $subject"
   # clear artifacts from any previous attempt of this sha: a crashed agent that
   # wrote nothing must never inherit a stale verdict file (it would be parsed
   # as this run's decision below)
@@ -361,14 +385,14 @@ run_one() { # <sha>
   esac
 
   if [ "$kind" = failed ] && [ "${STOP_ON_FAIL:-0}" = 1 ]; then
-    echo "[$short] FAILED: $verdict — STOP_ON_FAIL; see logs/$sha.log" | tee -a "$WALK_LOG"
+    echo "${PTAG}[$short] FAILED: $verdict — STOP_ON_FAIL; see logs/$sha.log" | tee -a "$WALK_LOG"
     die "stopping at $short"
   fi
 
   if [ "${CLASSIFY_ONLY:-0}" = 1 ]; then
     # dry-run decides but never mutates durable state: no baseline advance, no
     # progress marks, no commits — a later real run re-processes everything
-    echo "[$short] -> would-$kind ($verdict)  [dry-run]"
+    echo "${PTAG}[$short] -> would-$kind ($verdict)  [dry-run]"
     return 0
   fi
 
@@ -382,9 +406,9 @@ run_one() { # <sha>
              parent="$(g rev-parse --verify --quiet "$sha^" 2>/dev/null || true)"
              sync_set_baseline "${parent:-}"
              save_progress --arg b "$sha" --arg f "$short" '.processed += [$b] | .failed += 1 | .failures += [$f]'
-             echo "[$short]    analyze: logs/$sha.log  $( [ -f "$VERDICTS/$sha.transcript.jsonl" ] && echo "verdicts/$sha.transcript.jsonl (python3 -m vuln_agent.transcript <file>)" )";;
+              echo "${PTAG}[$short]    analyze: logs/$sha.log  $( [ -f "$VERDICTS/$sha.transcript.jsonl" ] && echo "verdicts/$sha.transcript.jsonl (python3 -m vuln_agent.transcript <file>)" )";;
   esac
-  echo "[$short] -> $kind ($verdict)"
+  echo "${PTAG}[$short] -> $kind ($verdict)"
 }
 
 # ---- CLI ----
@@ -538,8 +562,8 @@ fi
 load_known_skips
 
 # ---- commit list ----
-rl=(--reverse)
-[ "$SKIP_MERGES" = true ] && rl+=(--no-merges)
+rl=(--reverse); rln=()   # rln = same filters without --reverse, for rev-list --count
+[ "$SKIP_MERGES" = true ] && { rl+=(--no-merges); rln+=(--no-merges); }
 # optional pathspec scope: process only commits touching the configured subdirectory
 sc=()
 [ -n "$SCOPE" ] && sc=(-- "$SCOPE")
@@ -577,6 +601,12 @@ fi
 
 load_meta "${SHAS[@]}"
 
+# ---- progress totals: M = commits in the project history (walk filters applied),
+# queue = what this run still has to do (already-processed entries don't count) ----
+PROG_TOTAL="$(g rev-list --count ${rln[@]+"${rln[@]}"} HEAD ${sc[@]+"${sc[@]}"} 2>/dev/null || echo 0)"
+QUEUE_TOTAL=0
+for sha in "${SHAS[@]}"; do [[ -v PROC["$sha"] ]] || QUEUE_TOTAL=$((QUEUE_TOTAL+1)); done
+
 # ---- list mode ----
 if [ "$DO_LIST" = 1 ]; then
   p=0; s=0; d=0; ps=0
@@ -589,21 +619,22 @@ if [ "$DO_LIST" = 1 ]; then
     else dec="ANALYZE"; p=$((p+1)); fi
     printf '%-12s %-8s %s\n' "$short" "$dec" "$subj"
   done
-  echo "---"; echo "range=${#SHAS[@]} ANALYZE=$p SKIP=$s DONE=$d preseeded=$ps"
+  echo "---"; echo "range=${#SHAS[@]} ANALYZE=$p SKIP=$s DONE=$d preseeded=$ps total=$PROG_TOTAL"
   [ "$ps" -gt 0 ] && echo "SKIP* = preseeded NO_VULN (--reuse-verdicts / --skip-list)"
   exit 0
 fi
 
 {
   echo "=== vuln-walk started $(date -Iseconds) ==="
-  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N record_hints=$([ "$RECORD_HINTS" = 1 ] && echo "$PRIOR_REC_N" || echo 0)"
+  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} todo=$QUEUE_TOTAL total=$PROG_TOTAL worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N record_hints=$([ "$RECORD_HINTS" = 1 ] && echo "$PRIOR_REC_N" || echo 0)"
 } | tee -a "$WALK_LOG"
 
 count=0; last_short=""
 for sha in "${SHAS[@]}"; do
   [[ -v PROC["$sha"] ]] && continue
   [ "$LIMIT" -gt 0 ] && [ "$count" -ge "$LIMIT" ] && { echo "Reached --limit $LIMIT; stopping." | tee -a "$WALK_LOG"; break; }
-  count=$((count+1)); last_short="${SHORT[$sha]:-??????????}"
+  count=$((count+1)); QUEUE_POS=$count; last_short="${SHORT[$sha]:-??????????}"
+  PTAG="[$(prog_pos "$sha")] "
   run_one "$sha" 2>&1 | tee -a "$WALK_LOG"
 done
 

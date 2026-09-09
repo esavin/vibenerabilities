@@ -106,6 +106,12 @@ Each `VULN-NNN-*.md` record contains:
 A failed commit (LLM outage, timeout, validation error) rolls the baseline back to its
 parent and is requeued automatically on the next run — nothing is ever silently skipped.
 
+Each processed commit is prefixed with an interruption-stable progress counter
+(`[9/832] [ab12cd3] ANALYZE …`): `9` is the commit's absolute position in the project
+history, `832` the total with the current walk filters — so after any interruption and
+restart the numbering continues where it stopped, and you always see how much is done
+and how much remains.
+
 ## Restart after upstream changes
 
 The last fully-processed commit is stored (committed) in

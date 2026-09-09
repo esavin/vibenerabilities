@@ -236,6 +236,13 @@ The committed `agent/project/.vibenerabilities.json` holds the baseline. After `
 in the project, run.sh analyzes only `baseline..HEAD`. `--reset-baseline` restarts from
 zero.
 
+Every processed commit is prefixed with a progress counter — `[9/832] [ab12cd3] ANALYZE …`
+— where `9` is the commit's absolute position in the project history (oldest = 1) and
+`832` the total commit count with the current walk filters (`skip_merges`, `scope`). The
+numbering is **stable across interruptions**: a run restarted after 8 of 832 commits
+continues at `[9/832]`, and after syncing new upstream commits it continues past the old
+denominator (`[833/840]`). The run header shows `todo=N total=M` for the same reason.
+
 ## Re-running from scratch (verdict reuse)
 A `NO_VULN` verdict is a pure function of the commit (diff + tree), so it can be replayed
 across runs. Save the old run's `vibenerabilities/verdicts/` folder and pass it to the
