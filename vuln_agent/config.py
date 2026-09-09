@@ -99,7 +99,11 @@ TRIAGE_DEFAULTS = {
     "enabled": False,
     # "" = llm.model; point at a cheaper/faster model if the endpoint has one
     "model": "",
-    "diff_chars": 16_000,
+    # 0 = AUTO: derive from the persisted provider window (verdicts/
+    # provider-limit.json, ~3 chars per input token minus reserve) with a
+    # conservative fallback until a window is learned; an explicit value
+    # always wins
+    "diff_chars": 0,
     "message_chars": 2_000,
     "name_status_chars": 6_000,
     # when EVERY changed file matches one of these globs, skip with no LLM

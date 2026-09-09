@@ -31,6 +31,7 @@ import subprocess
 import sys
 import time
 
+from .agent import PROVIDER_LIMIT_FILE
 from .config import (ConfigError, load_config, resolve_llm, resolve_limits,
                      resolve_triage)
 from .llm import ChatClient
@@ -129,7 +130,9 @@ def main(argv=None):
                        root_commit=None, old_paths=None, changed=0,
                        limits=limits, transcript=None,
                        model=llm["model"], base_url=llm["base_url"],
-                       cache_dir=cache_dir)
+                       cache_dir=cache_dir,
+                       limit_state_path=os.path.join(
+                           args.verdicts_dir, PROVIDER_LIMIT_FILE))
             handled.add(sha)
         # the walk advances meanwhile: re-derive the window promptly
         time.sleep(min(args.interval, 2))

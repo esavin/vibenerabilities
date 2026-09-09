@@ -369,7 +369,8 @@ def main(argv=None):
                 root_commit=root_commit, old_paths=old_paths,
                 changed=changed, limits=limits, transcript=transcript,
                 model=triage["model"], base_url=llm["base_url"],
-                cache_dir=os.path.join(args.verdicts_dir, "triage"))
+                cache_dir=os.path.join(args.verdicts_dir, "triage"),
+                limit_state_path=limit_state_path)
 
         if triage_skip is not None:
             session_verdicts = [triage_skip]

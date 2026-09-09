@@ -208,9 +208,12 @@ silently lost their INDEX.md row; all of it is mechanically checkable:
   LLM call at all. Measured on a 634-commit walk with a wandering model: multi-step
   NO_VULN sessions were ~57% of total wall time (~9h of 15.4h) at ~111s mean per
   commit — the cascade replaces most of those with one ~700-token request.
-  `triage.diff_chars` sizing rule: ~3 chars per input-token of the model window, with
-  headroom (a 46k-token window comfortably takes `48000`); oversized diffs always get
-  the FULL session, so raising the cap only adds triage coverage, never risk.
+  `triage.diff_chars: 0` (default) is AUTO: the cap is derived from the provider window
+  the pipeline discovered (`verdicts/provider-limit.json`, ~3 chars per input token
+  minus a reserve; a conservative 16k fallback applies until a window is learned —
+  e.g. a 46k-token window auto-caps at ~132k chars). An explicit value always wins,
+  and a triage request that still overflows learns the real limit and falls back to
+  the full session, so a wrong cap can never break a commit.
 - **Triage prefetch** (`triage.prefetch_ahead: 3`): run.sh then starts a background
   worker (`vuln_agent.prefetch`, log in `logs/prefetch.log`) that keeps triage
   decisions cached this many commits ahead of the walk (`verdicts/triage/<sha>.json`),

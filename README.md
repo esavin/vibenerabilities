@@ -107,7 +107,8 @@ Each `VULN-NNN-*.md` record contains:
 
 **Optional triage cascade** (`triage.*` in config, off by default): each commit
 first gets ONE cheap no-tools request — subject, full message, name-status and
-the COMPLETE diff whenever it fits `triage.diff_chars` — and only a confident
+the COMPLETE diff whenever it fits `triage.diff_chars` (0 = auto-sized from the
+provider window the pipeline discovered) — and only a confident
 `CLEARLY_IRRELEVANT` answer marks the commit NO_VULN without a full session.
 Everything else falls through to the full three-pass session: fix/security
 keywords in the message, any rename/deletion, root commits, oversized diffs,

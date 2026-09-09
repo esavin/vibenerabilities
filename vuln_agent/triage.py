@@ -37,6 +37,18 @@ import re
 import subprocess
 import time
 
+from .agent import load_provider_limit, save_provider_limit
+from .llm import ContextOverflowError
+
+# triage.diff_chars == 0 (or absent): auto-size the cap from the persisted
+# provider window (verdicts/provider-limit.json) - ~3.5 chars per input token
+# leaves room for the triage overhead (~2.5k tokens) and the one-line reply.
+# No window discovered yet (fresh workspace, no overflow ever seen): fall back
+# to the conservative historical default until one is learned.
+AUTO_DIFF_CHARS_FALLBACK = 16_000
+AUTO_CHARS_PER_TOKEN = 3
+AUTO_WINDOW_RESERVE_TOKENS = 2_000
+
 TRIAGE_SYSTEM = """You are a fast pre-filter of a commit-by-commit security-analysis \
 pipeline. For each commit you decide whether a full analysis session (an agent \
 that reads the worktree and updates vulnerability records) must examine it, or \
@@ -195,10 +207,21 @@ def save_triage_cache(cache_dir, sha, model, decision, reason, usage):
         pass
 
 
+def auto_diff_chars(limit_state_path=None, base_url=""):
+    """Auto cap for triage.diff_chars == 0: derived from the persisted
+    provider window; the conservative fallback when none is known yet."""
+    known = load_provider_limit(limit_state_path, model="", base_url=base_url)
+    if not known:
+        return AUTO_DIFF_CHARS_FALLBACK, None
+    chars = max(4_000, AUTO_CHARS_PER_TOKEN * max(0, known
+                                                  - AUTO_WINDOW_RESERVE_TOKENS))
+    return chars, known
+
+
 def run_triage(client, worktree, sha, cfg, log,
                root_commit=False, old_paths=None, changed=0,
                limits=None, transcript=None, model="", base_url="",
-               cache_dir=None):
+               cache_dir=None, limit_state_path=None):
     """Decide skip-vs-analyze for one commit.
 
     Returns a NO_VULN verdict dict when the commit may skip the full session,
@@ -217,6 +240,13 @@ def run_triage(client, worktree, sha, cfg, log,
     """
     lim = limits if isinstance(limits, dict) else {}
     diff_cap = int(cfg.get("diff_chars") or 0)
+    if diff_cap <= 0:
+        # auto: size from the provider's discovered window (3 chars per
+        # token minus reserve); conservative fallback until one is learned
+        diff_cap, known = auto_diff_chars(limit_state_path, base_url)
+        log("triage: diff_chars auto = %d%s"
+            % (diff_cap, " (provider window %d tokens)" % known
+               if known else " (no provider window learned yet - fallback)"))
     message_cap = int(cfg.get("message_chars") or 2000)
     ns_cap = int(cfg.get("name_status_chars") or 6000)
     globs = cfg.get("irrelevant_globs") or []
@@ -318,6 +348,14 @@ def run_triage(client, worktree, sha, cfg, log,
         response = client.chat(
             [{"role": "system", "content": TRIAGE_SYSTEM},
              {"role": "user", "content": user}], [])
+    except ContextOverflowError as exc:
+        # the auto cap (or a manual one) overshot the window: learn the real
+        # limit for future auto-sizing and let the full session handle it
+        url = base_url or ""
+        save_provider_limit(limit_state_path, exc.limit or 0,
+                            model=model, base_url=url)
+        return refuse("triage request over the provider window "
+                      "(diff %d chars, limit %s)" % (len(diff), exc.limit))
     except Exception as exc:  # FatalLLMError et al - never block the commit
         return refuse("triage request failed (%s)" % exc)
 
