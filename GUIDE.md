@@ -247,6 +247,32 @@ silently lost their INDEX.md row; all of it is mechanically checkable:
   (`CLASSIFY` lines). Expected speedup at 12–15% VULN commits with K=6–8: ~3–4x —
   the ceiling is the serialized VULN tape (0.15 × N × ~250s), so raise K only while
   classify lines still dominate `walk.log`.
+- **Range-squash for guard-forced noise** (`--squash`, or config `squash.enabled`;
+  sequential walk only): a NO_VULN on a "probably irrelevant" commit is the common
+  outcome of a full multi-step session the triage cascade could not skip — the classic
+  is a docs/tests-only commit whose *message* contains a fix/security keyword (the
+  keyword guard refuses any cheap path). Runs of `squash.min_series` (default 3) or
+  more such commits are glued into ONE classify-only session over the **cumulative**
+  diff `first^..tip`: the agent sees the cumulative name-status/diff plus every
+  member's short-sha+subject, may drill into single commits with `git show -M`, and
+  finishes `NO_VULN` only when the WHOLE range is clearly irrelevant. Any other
+  answer (vuln candidate, doubt, ERROR) **splits** the range back into per-commit
+  full record sessions, so recall is never traded for speed. The planner
+  (`vuln_agent/squash.py`) is pure git plumbing: a commit may join a range only when
+  it is not a root/merge commit, renames/deletes nothing, its individual diff fits
+  `squash.member_diff_chars` (0 = `limits.diff_chars`), and it belongs to a
+  configured class — `keyword` (message matches the same Pass-B keyword list the
+  triage cascade uses) and/or `globs` (every changed file matches
+  `triage.irrelevant_globs`); preseeded (`--reuse-verdicts`/`--skip-list`),
+  prior-run-hint and regex-skip commits never join. Ranges are capped at
+  `squash.max_commits` members (default 12) and a cumulative diff of
+  `squash.diff_chars` (0 = AUTO: 2 × `limits.diff_chars`). Member verdicts carry a
+  `NO_VULN(squash <a>..<b>)` marker that `--reuse-verdicts` replays like any other
+  NO_VULN; transcripts/verdict JSONs note the `squash_range`. Preview the plan with
+  `run.sh --list --squash` (SQUASH decisions, no agent calls); watch `SQUASH n
+  commits` / `CLEAN (squashed a..b)` / `-> split (...)` lines in `walk.log`. With
+  `--parallel` the flag is ignored with a warning — classify-ahead already cheapens
+  guard-forced commits.
 - **Provider context-limit persistence** (automatic): the first session that hits a
   context-overflow HTTP 400 persists the provider-reported window to
   `verdicts/provider-limit.json`; every later session seeds its compaction threshold
@@ -436,6 +462,10 @@ fields in the template explain each):
 | `validation.mode` | `strict` (errors → ERROR verdict, commit requeued) / `warn` / `off` | `strict` |
 | `validation.rounds` | agent repair rounds before the final verdict | `2` |
 | `validation.path_check` | severity of the cited-path-exists check | `warn` |
+| `squash.enabled` | range-squash of guard-forced probably-irrelevant runs (also `--squash`) | `false` |
+| `squash.classes` | candidate classes: `keyword` (Pass-B keyword message) and/or `globs` (all files under `triage.irrelevant_globs`) | `["keyword","globs"]` |
+| `squash.min_series` / `max_commits` | range size bounds (shorter runs stay per-commit / hard member cap) | `3` / `12` |
+| `squash.member_diff_chars` / `diff_chars` | per-commit candidacy cap / cumulative range diff cap (0 = AUTO: `limits.diff_chars` / 2 × `limits.diff_chars`) | `0` / `0` |
 
 ## Troubleshooting
 - **A commit FAILED — what happens** — verdict files for the SHA are cleared before

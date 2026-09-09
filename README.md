@@ -126,6 +126,21 @@ The agent also persists a provider-reported context window
 later sessions seed their compaction threshold instead of re-discovering the
 limit the hard way.
 
+**Adaptive range-squash** (`--squash`, or config `squash.enabled`): runs of
+`squash.min_series`+ consecutive guard-forced probably-irrelevant commits —
+the classic is a docs/tests-only commit whose message carries a fix/security
+keyword, which the triage cascade refuses to clear — are classified in ONE
+agent session over the cumulative range diff (`vuln_agent/squash.py` plans
+the ranges with pure git plumbing: candidates must be non-root, non-merge,
+rename/delete-free and small). The session runs classify-only at the range
+tip, sees the cumulative diff plus every member's subject, and may drill
+into single commits with `git show`. A `NO_VULN` answer finalizes the whole
+run (member verdicts carry a `NO_VULN(squash a..b)` marker that
+`--reuse-verdicts` replays like any other); ANY other answer (vuln
+candidate, doubt, error) splits the range back into per-commit full record
+sessions — recall before speed. Sequential walk only (ignored with
+`--parallel`); preview with `--list --squash`.
+
 **Parallel classify-ahead** (`--parallel K`, worktree mode only): a NO_VULN
 verdict is a pure function of the commit, so K workers can *classify*
 commits ahead of the walk — each in classify-only mode against a per-window
@@ -200,6 +215,12 @@ accepted. See `GUIDE.md` for the full semantics.
 --record-hints       with --reuse-verdicts: reconsideration round feeding the prior
                      run's record content back on a NO_VULN flip
   --in-place           checkout in the source clone instead of a worktree
+  --squash             squash runs of guard-forced probably-irrelevant commits
+                       (e.g. docs-only commits with fix/security keywords in
+                       the message) into ONE session over the cumulative range
+                       diff; NO_VULN finalizes the run, anything else splits
+                       it back into per-commit sessions (config squash.*;
+                       sequential walk only, preview with --list --squash)
   --parallel [K]       classify-ahead: K workers (default 4, config
                        parallel.workers) pre-classify windows of commits
                        (config parallel.window, default 32) in classify-only

@@ -62,6 +62,16 @@
     "path_check": "warn"
   },
 
+  "squash": {
+    "$comment": "R2 range-squash (run.sh --squash): runs of consecutive guard-forced probably-irrelevant commits - the classic is a docs/tests-only commit whose message contains a fix/security keyword, which the triage cascade cannot clear - are classified in ONE agent session over the cumulative diff first^..tip. NO_VULN finalizes the whole run; any other verdict (VULN candidate, ERROR) splits it back into per-commit full sessions, so recall is never traded for speed. classes: which guard-forced commits may join a range - 'keyword' (message matches the Pass B fix/security keyword list) and/or 'globs' (every changed file matches triage.irrelevant_globs). min_series: shorter runs stay per-commit. max_commits: hard cap on members per range. member_diff_chars: per-commit diff cap for candidacy (0 = limits.diff_chars). diff_chars: cumulative range diff cap (0 = AUTO: 2 x limits.diff_chars). Candidates are never root/merge/rename/delete commits, never preseeded (--reuse-verdicts/--skip-list), prior-run-hint or regex-skip commits. Sequential walk only - ignored with --parallel.",
+    "enabled": false,
+    "classes": ["keyword", "globs"],
+    "min_series": 3,
+    "max_commits": 12,
+    "member_diff_chars": 0,
+    "diff_chars": 0
+  },
+
   "run_timeout_seconds": 0,
 
   "parallel": {

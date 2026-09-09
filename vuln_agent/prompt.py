@@ -29,6 +29,13 @@ show old -> new paths; deletions (D) show the removed path.
 - FULL DIFF (when present): the complete rename-aware diff of this commit. When \
 present, the whole change is already in front of you - do NOT re-fetch it with \
 `git show`; read worktree files only when you need surrounding context.
+- SQUASHED RANGE MODE (when present): this ONE session classifies a RANGE of \
+commits at once. The RANGE COMMITS listing shows every member (oldest first); \
+the FULL DIFF is the cumulative first-parent..tip change over the whole range. \
+finish NO_VULN only when EVERY commit in the range is clearly free of security \
+relevance; otherwise finish VULN_UPDATED with an EMPTY files list so the \
+pipeline replays the range commit-by-commit with full sessions. Records are \
+never written in this mode.
 - STALE RECORD REFERENCES (when present): records that cite paths renamed/deleted \
 by THIS commit. This is your mandatory repair worklist.
 - INITIAL SNAPSHOT MODE (root commits only): replaces the diff with a TREE DIGEST \
@@ -39,7 +46,8 @@ are at a different point in history. The worktree is READ-ONLY context.
 - RECORDS ROOT: absolute path of the vulnerability records map you may write to \
 (INDEX.md, vulnerabilities/VULN-NNN-<slug>.md, design/NN-<topic>.md, \
 project-conventions.md).
-- MODE: "record" or "classify-only".
+- MODE: "record", "classify-only", or "squash-range" (classify a whole range \
+of commits; decide clean-vs-split, write nothing).
 - The full generic methodology is at <RECORDS ROOT>/methodology.md - read it only \
 if the digest below is not enough.
 
@@ -692,8 +700,50 @@ def focus_section(focus):
     return "\n".join(lines)
 
 
+def _range_listing(worktree, shas):
+    """One line per squash-range member: short sha, date, subject."""
+    out = _git(worktree, ["log", "--no-walk=unsorted",
+                          "--format=%h %ad %s", "--date=short"] + list(shas))
+    lines = [line for line in out.splitlines() if line.strip()]
+    if len(lines) != len(shas):
+        raise InspectError("cannot list squash range members")
+    return lines
+
+
+def squash_range_section(shas, first_parent):
+    """Instructions pinned to a squashed-range classification session."""
+    lines = [
+        "SQUASHED RANGE MODE - this ONE session classifies the WHOLE range of "
+        "%d commits below (the pipeline glued together consecutive commits "
+        "its pre-filters consider PROBABLY irrelevant but still had to "
+        "examine for recall - e.g. docs/tests-only commits with fix/security "
+        "keywords in their messages):" % len(shas),
+        "- The FULL DIFF is the CUMULATIVE diff %s..%s: what the WHOLE range "
+        "changes between the first member's parent and the tip. A change "
+        "introduced and later REVERTED inside the range is invisible in it - "
+        "fetch any single commit with `git show -M <sha>` when in doubt."
+        % (first_parent[:10], shas[-1][:10]),
+        "- Pass A: run on the cumulative diff (what the range introduces at "
+        "the tip). Pass B: scan EVERY subject in the listing against the "
+        "fix/security keyword list; when a subject hints a fix OR any hunk "
+        "removes/replaces a dangerous pattern, inspect that one commit "
+        "individually (`git show -M <sha>`). Pass C: as usual, at the tip.",
+        "- The worktree stands at the TIP commit; git history commands see "
+        "the full range (full messages: `git log --format='%h %B' -1 <sha>`).",
+        "- FINISH RULES (range mode): NO_VULN only when EVERY commit is "
+        "clearly free of security relevance (documentation, comments, tests, "
+        "formatting, build metadata, assets, cosmetic changes with no "
+        "dangerous-pattern change). If ANY commit introduces/fixes/reveals a "
+        "vulnerability - or you are simply not sure about ONE - finish with "
+        "VULN_UPDATED and an EMPTY files list: the pipeline then replays the "
+        "range commit-by-commit with full sessions. Use ERROR only when the "
+        "range genuinely cannot be inspected, never for a mere finding.",
+    ]
+    return "\n".join(lines)
+
+
 def build_first_user(sha, worktree, records_root, mode, today, conventions,
-                     limits=None, focus=None):
+                     limits=None, focus=None, squash_range=None):
     """Build the first user message. Returns (text, info) where info carries
     {"is_root": bool, "old_paths": [...], "changed": int} for the caller
     (validation old-paths and adaptive step budgeting).
@@ -702,7 +752,13 @@ def build_first_user(sha, worktree, records_root, mode, today, conventions,
     {record: [old paths]}} - the session is pinned to repairing exactly these
     records; the diff injection, records numbering and the records-map
     overview are skipped (not needed for repair), keeping the session context
-    minimal."""
+    minimal.
+
+    `squash_range` (R2 range mode): ordered SHAs oldest..tip (tip == sha) -
+    the session classifies the whole range via the CUMULATIVE diff
+    first^..tip instead of one commit's diff; records numbering/overview are
+    skipped (the session decides clean-vs-split only; record sessions do the
+    bookkeeping)."""
     lim = limits if isinstance(limits, dict) else {}
     subject = _git(worktree, ["log", "-1", "--format=%s", sha]).strip()
     message = _git(worktree, ["log", "-1", "--format=%B", sha]).strip()
@@ -712,7 +768,44 @@ def build_first_user(sha, worktree, records_root, mode, today, conventions,
     changed = 0
     sections = []
 
-    if root:
+    if squash_range:
+        first = squash_range[0]
+        if first == sha:
+            raise InspectError("squash range needs >= 2 distinct commits")
+        first_parent = parent_sha(worktree, first)
+        if not first_parent:
+            raise InspectError("squash range member %s has no parent" % first)
+        status_text, old_paths, changed = name_status(worktree, first_parent,
+                                                      sha)
+        if status_text:
+            sections.append(
+                "NAME STATUS (CUMULATIVE git diff --name-status -M %s..%s - "
+                "over the WHOLE range):\n%s"
+                % (first_parent[:10], sha[:10],
+                   _cap(status_text,
+                        int(lim.get("name_status_chars") or 20000)))
+            )
+        diff_cap = int(lim.get("squash_diff_chars")
+                       or lim.get("diff_chars") or 0)
+        diff = _git_ok(worktree, ["diff", "-M", first_parent, sha]).strip("\n")
+        if diff and diff_cap > 0 and len(diff) <= diff_cap:
+            sections.append(
+                "FULL DIFF (CUMULATIVE %s..%s - the COMPLETE change over the "
+                "whole range, nothing truncated; a change reverted INSIDE "
+                "the range is invisible here):\n%s"
+                % (first_parent[:10], sha[:10], diff)
+            )
+        else:
+            sections.append(
+                "FULL DIFF: the cumulative range diff does not fit here - "
+                "fetch per-commit diffs with `git show -M <sha>` from the "
+                "RANGE COMMITS listing."
+            )
+        sections.append("RANGE COMMITS (%d, oldest first):\n%s"
+                        % (len(squash_range),
+                           "\n".join(_range_listing(worktree, squash_range))))
+        sections.append(squash_range_section(squash_range, first_parent))
+    elif root:
         sections.append(
             "INITIAL SNAPSHOT MODE: this is the ROOT commit (no parent) - the whole "
             "codebase appears at once. There is no diff; this is a deep Pass C scan "
@@ -768,7 +861,7 @@ def build_first_user(sha, worktree, records_root, mode, today, conventions,
                 "search_records for each old path):\n%s" % stale
             )
 
-    if focus is None:
+    if focus is None and not squash_range:
         numbering = records_numbering(records_root)
         if numbering:
             sections.append(
@@ -792,14 +885,27 @@ def build_first_user(sha, worktree, records_root, mode, today, conventions,
     if not conventions:
         conventions = ("(missing - infer conservatively from the source tree and flag "
                        "uncertainties in the record footer)")
-    parts = [
-        "COMMIT: %s" % sha,
-        "SUBJECT: %s" % (subject or "(none)"),
-        "",
-        "FULL COMMIT MESSAGE:",
-        message or "(none)",
-        "",
-    ]
+    if squash_range:
+        parts = [
+            "COMMIT RANGE: %d commits squashed into this ONE session "
+            "(oldest %s, tip %s)"
+            % (len(squash_range), squash_range[0][:10], sha[:10]),
+            "TIP COMMIT: %s" % sha,
+            "TIP SUBJECT: %s" % (subject or "(none)"),
+            "",
+            "TIP FULL COMMIT MESSAGE:",
+            message or "(none)",
+            "",
+        ]
+    else:
+        parts = [
+            "COMMIT: %s" % sha,
+            "SUBJECT: %s" % (subject or "(none)"),
+            "",
+            "FULL COMMIT MESSAGE:",
+            message or "(none)",
+            "",
+        ]
     parts.extend(section + "\n" for section in sections)
     parts.extend([
         "WORKTREE: %s" % worktree,
@@ -810,9 +916,15 @@ def build_first_user(sha, worktree, records_root, mode, today, conventions,
         "PROJECT CONVENTIONS (from project-conventions.md):",
         _cap(conventions.strip(), int(lim.get("conventions_chars") or 12000)),
         "",
-        "Begin: inspect the commit, run the three detection passes, update the "
-        "records map if warranted, then call finish.",
     ])
+    if squash_range:
+        parts.append(
+            "Begin: classify the WHOLE range per the SQUASHED RANGE MODE "
+            "rules above, then call finish once.")
+    else:
+        parts.append(
+            "Begin: inspect the commit, run the three detection passes, update the "
+            "records map if warranted, then call finish.")
     return "\n".join(parts), {"is_root": root, "old_paths": old_paths,
                               "changed": changed}
 

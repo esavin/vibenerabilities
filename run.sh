@@ -628,6 +628,109 @@ replay_one() { # <sha> — parallel replay step, in history order
   record_session "$sha"
 }
 
+# ---- R2: adaptive range-squash of guard-forced "uninteresting" runs ----
+# (--squash flag or config squash.enabled; sequential walk only). A run of
+# >= squash.min_series consecutive commits that are PROBABLY irrelevant but
+# a recall guard forces into a full session (the classic: docs/tests-only
+# commits with fix/security keywords in their messages - the triage cascade
+# skips them without a judgment, so each gets a full multi-step session that
+# almost always ends NO_VULN) is classified in ONE agent session over the
+# CUMULATIVE diff first^..tip. vuln_agent.squash plans the ranges (pure git
+# plumbing against the source clone, no LLM, no worktrees): candidates must
+# be non-root, non-merge, rename/delete-free, individually small, and in a
+# configured guard-forced class ("keyword" message match / all-files-match
+# irrelevant_globs); never preseeded, prior-run-hint or regex-skip commits.
+# A NO_VULN range verdict FINALIZES every member (the same purity contract
+# --reuse-verdicts relies on); any other answer (VULN candidate, doubt,
+# ERROR) SPLITS the range back into per-commit full record sessions - recall
+# before speed. The range session runs classify-only at the range TIP, so it
+# never writes records; Pass B drill-down into single commits stays possible
+# via the git tool (git show -M <sha>).
+
+squash_plan() { # <todo-file> -> plan lines on stdout (RANGE n sha... | SINGLE sha)
+  local excl="$1.excluded" sha
+  : > "$excl"
+  # commits run.sh already handles without a full session break ranges:
+  # preseeded NO_VULN replays, prior-run hint commits (reconsideration round
+  # lives in the record phase), regex skips
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    if [[ -v CACHED_SKIP["$sha"] ]] \
+       || { [ "$RECORD_HINTS" = 1 ] && [[ -v PRIOR_REC["$sha"] ]]; } \
+       || regex_skips "$sha" "${SUBJ[$sha]:-}"; then
+      printf '%s\n' "$sha" >> "$excl"
+    fi
+  done < "$1"
+  python3 -m vuln_agent.squash --config "$CONFIG" --source "$SOURCE_DIR" \
+    --enabled --exclude "$excl" \
+    < "$1" 2> >(tee -a "$WALK_LOG" >&2)
+  rm -f "$excl"
+}
+
+squash_range_session() { # <members...> — ONE classify session over the cumulative range diff
+  local members=("$@") first tip tip_short csv path rc verdict m marker
+  first="${members[0]}"; tip="${members[${#members[@]}-1]}"
+  tip_short="${SHORT[$tip]}"
+  csv="$(IFS=,; printf '%s' "${members[*]}")"
+
+  path="$(make_tree "$tip")"
+  CUR_TREE="$path"
+  local ag=(python3 -m vuln_agent --config "$CONFIG" --sha "$tip" --worktree "$path"
+            --records-root "$RECORDS_ROOT" --records-root-rel "$RECORDS_ROOT_REL"
+            --verdicts-dir "$VERDICTS" --classify-only --squash-range "$csv")
+  local model="${OVERRIDE_MODEL:-$CFG_MODEL}"; [ -n "$model" ] && ag+=(--model "$model")
+
+  echo "${PTAG}[${SHORT[$first]}..$tip_short] SQUASH ${#members[@]} commits (guard-forced noise)  ${SUBJ[$first]}"
+  # same stale-verdict rule as record_session: a crashed planner/session must
+  # never inherit a previous attempt's decision
+  rm -f "$VERDICTS/$tip.txt" "$VERDICTS/$tip.json"
+  rc=0
+  if [ -n "$RUN_TIMEOUT" ] && [ "$RUN_TIMEOUT" != 0 ] && command -v timeout >/dev/null 2>&1; then
+    timeout "${RUN_TIMEOUT}s" "${ag[@]}" > "$RUN_LOGS/$tip.log" 2>&1 || rc=$?
+  else
+    "${ag[@]}" > "$RUN_LOGS/$tip.log" 2>&1 || rc=$?
+  fi
+  free_tree "$path"
+  CUR_TREE=""
+
+  verdict="$(head -1 "$VERDICTS/$tip.txt" 2>/dev/null || true)"
+  case "$verdict" in
+    VERDICT:\ NO_VULN*)
+      marker="NO_VULN(squash ${SHORT[$first]}..$tip_short)"
+      for m in "${members[@]}"; do
+        count=$((count+1)); QUEUE_POS=$count; last_short="${SHORT[$m]:-??????????}"
+        PTAG="[$(prog_pos "$m")] "
+        if [ "$CLASSIFY_ONLY" = 1 ]; then
+          echo "${PTAG}[${SHORT[$m]}] -> would-clean (squashed)  [dry-run]"
+          continue
+        fi
+        # verdict stubs for every member FIRST (the tip's session artifacts
+        # stay; the txt gets the squash marker for traceability/reuse), then
+        # baseline + progress - an interrupt mid-finalize costs at most the
+        # tail's re-analysis, never a clean mark without a verdict
+        printf 'VERDICT: %s\n' "$marker" > "$VERDICTS/$m.txt"
+        echo "${PTAG}[${SHORT[$m]}] CLEAN (squashed ${SHORT[$first]}..$tip_short)  ${SUBJ[$m]}"
+        sync_set_baseline "$m"
+        save_progress --arg b "$m" '.processed += [$b] | .skipped += 1'
+      done
+      echo "${PTAG}[${SHORT[$first]}..$tip_short] -> squashed clean: ${#members[@]} commit(s), one session"
+      ;;
+    *)
+      # any other answer (VULN candidate, doubt, ERROR, missing verdict)
+      # SPLITS the range: every member gets its own full record session
+      # against the live records map, in history order (record_session
+      # clears the stale tip verdict before running)
+      echo "${PTAG}[${SHORT[$first]}..$tip_short] -> split (${verdict:-NO_VERDICT(rc=$rc)}) - replaying ${#members[@]} commit(s) one-by-one"
+      for m in "${members[@]}"; do
+        count=$((count+1)); QUEUE_POS=$count; last_short="${SHORT[$m]:-??????????}"
+        PTAG="[$(prog_pos "$m")] "
+        record_session "$m"
+      done
+      ;;
+  esac
+  return 0
+}
+
 # ---- CLI ----
 read -r -d '' USAGE <<'EOF' || true
 Usage: run.sh [options]
@@ -674,6 +777,15 @@ Usage: run.sh [options]
                   hint commits) gets a full record session as the only
                   writer. Roughly 3-4x faster on large histories; needs
                   worktree mode. Watch live classification in walk.log.
+  --squash        Adaptive range-squash: runs of >= squash.min_series
+                   consecutive guard-forced probably-irrelevant commits (e.g.
+                   docs/tests-only commits with fix/security keywords in the
+                   message) are classified in ONE session over the cumulative
+                   range diff (config squash.*: min_series 3, max_commits 12,
+                   cumulative diff <= 2 x limits.diff_chars). NO_VULN
+                   finalizes the whole run; any other answer splits it back
+                   into per-commit full sessions (recall first). Sequential
+                   walk only - ignored with --parallel.
   --in-place      Checkout each commit in the source clone instead of a worktree.
   --stop-on-fail  Halt on the first failed commit (default: record, roll the
                   baseline back to the parent and continue; failed commits are
@@ -688,6 +800,7 @@ STOP_ON_FAIL=0; CLASSIFY_ONLY=0; VALIDATE=0; VALIDATE_REF=""
 REUSE_VERDICTS=""; SKIP_LIST=""; RECORD_HINTS=0
 SNAPSHOT=0; SNAPSHOT_REF=""
 PARALLEL=0; PAR_WINDOW=""   # -1 = --parallel given without N
+SQUASH_FLAG=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --list) DO_LIST=1;;
@@ -706,6 +819,7 @@ while [ $# -gt 0 ]; do
     --parallel) PARALLEL=-1
                  if [ $# -ge 2 ] && [[ "$2" =~ ^[1-9][0-9]*$ ]]; then PARALLEL="$2"; shift; fi;;
     --parallel-window) PAR_WINDOW="${2:?--parallel-window needs W}"; shift;;
+    --squash) SQUASH_FLAG=1;;
     --in-place) USE_WORKTREE=false;;
     --stop-on-fail) STOP_ON_FAIL=1;;
     --no-commit) AUTO_COMMIT=false;;
@@ -741,6 +855,18 @@ else
   PARALLEL=0   # --parallel 1 = plain sequential walk
 fi
 
+# ---- --squash resolution (R2 range-squash) ----
+SQUASH_ON=0
+if [ "$SQUASH_FLAG" = 1 ] || [ "$(jbool '.squash.enabled')" = true ]; then
+  SQUASH_ON=1
+  if [ "$PARALLEL" -ge 2 ] && [ "$DO_LIST" = 0 ] && [ "$VALIDATE" = 0 ]; then
+    # classify-ahead already cheapens guard-forced commits; the explicit
+    # --parallel choice wins, so squash quietly steps aside
+    echo "warn: --squash ignored with --parallel (classify-ahead already cheapens guard-forced commits)" >&2
+    SQUASH_ON=0
+  fi
+fi
+
 init_sync; init_progress
 
 [ "$RESET_BASE" = 1 ] && { sync_set_baseline ""; rm -f "$PROGRESS"; init_progress; echo "Baseline reset to start."; exit 0; }
@@ -752,8 +878,8 @@ if [ "$SNAPSHOT" = 1 ]; then
   if [ "$DO_LIST" != 0 ] || [ "$RESET_BASE" != 0 ] || [ "$VALIDATE" != 0 ] \
      || [ "$CLASSIFY_ONLY" != 0 ] || [ -n "$SINGLE" ] || [ -n "$RANGE" ] \
      || [ "$LIMIT" != 0 ] || [ -n "$REUSE_VERDICTS" ] || [ -n "$SKIP_LIST" ] \
-     || [ "$RECORD_HINTS" != 0 ] || [ "$PARALLEL" != 0 ]; then
-    die "--snapshot cannot be combined with --list/--dry-run/--validate/--reset-baseline/--sha/--range/--limit/--reuse-verdicts/--skip-list/--record-hints/--parallel"
+     || [ "$RECORD_HINTS" != 0 ] || [ "$PARALLEL" != 0 ] || [ "$SQUASH_ON" != 0 ]; then
+    die "--snapshot cannot be combined with --list/--dry-run/--validate/--reset-baseline/--sha/--range/--limit/--reuse-verdicts/--skip-list/--record-hints/--parallel/--squash"
   fi
   [ -n "${OVERRIDE_MODEL:-}" ] || [ -n "$CFG_MODEL" ] || [ -n "${VULN_MODEL:-}" ] || \
     die "no model configured: set llm.model in config.json or export VULN_MODEL"
@@ -864,24 +990,45 @@ for sha in "${SHAS[@]}"; do [[ -v PROC["$sha"] ]] || QUEUE_TOTAL=$((QUEUE_TOTAL+
 
 # ---- list mode ----
 if [ "$DO_LIST" = 1 ]; then
-  p=0; s=0; d=0; ps=0
+  p=0; s=0; d=0; ps=0; sq=0
+  declare -A SQ_DEC=()
+  if [ "$SQUASH_ON" = 1 ]; then
+    # plan preview: local git plumbing only, no agent calls
+    todo_file="$(mktemp "$VERDICTS/.squash-todo.XXXXXX")"
+    for sha in "${SHAS[@]}"; do [[ -v PROC["$sha"] ]] || printf '%s\n' "$sha"; done > "$todo_file"
+    while IFS= read -r pline; do
+      case "$pline" in
+        RANGE\ *) read -r _kw _pn _prest <<<"$pline"
+                  read -r -a _pm <<<"$_prest"
+                  for _m in "${_pm[@]}"; do SQ_DEC["$_m"]="${_pm[0]:0:7}..${_pm[${#_pm[@]}-1]:0:7}"; done
+                  sq=$((sq + _pn));;
+      esac
+    done < <(squash_plan "$todo_file")
+    rm -f "$todo_file"
+  fi
   printf '%-12s %-8s %s\n' SHORT DECISION SUBJECT
   for sha in "${SHAS[@]}"; do
     subj="${SUBJ[$sha]:-?}"; short="${SHORT[$sha]:-??????????}"
     if [[ -v PROC["$sha"] ]]; then dec="DONE"; d=$((d+1))
     elif [[ -v CACHED_SKIP["$sha"] ]]; then dec="SKIP*"; ps=$((ps+1))
     elif regex_skips "$sha" "$subj"; then dec="SKIP"; s=$((s+1))
+    elif [[ -v SQ_DEC["$sha"] ]]; then dec="SQUASH"
     else dec="ANALYZE"; p=$((p+1)); fi
-    printf '%-12s %-8s %s\n' "$short" "$dec" "$subj"
+    if [[ -v SQ_DEC["$sha"] ]]; then
+      printf '%-12s %-8s %s\n' "$short" "$dec" "range ${SQ_DEC[$sha]}: $subj"
+    else
+      printf '%-12s %-8s %s\n' "$short" "$dec" "$subj"
+    fi
   done
-  echo "---"; echo "range=${#SHAS[@]} ANALYZE=$p SKIP=$s DONE=$d preseeded=$ps total=$PROG_TOTAL"
+  echo "---"; echo "range=${#SHAS[@]} ANALYZE=$p SQUASH=$sq SKIP=$s DONE=$d preseeded=$ps total=$PROG_TOTAL"
   [ "$ps" -gt 0 ] && echo "SKIP* = preseeded NO_VULN (--reuse-verdicts / --skip-list)"
+  [ "$sq" -gt 0 ] && echo "SQUASH = guard-forced commit joining a squashed range (--squash; run to classify ranges in bulk)"
   exit 0
 fi
 
 {
   echo "=== vuln-walk started $(date -Iseconds) ==="
-  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} todo=$QUEUE_TOTAL total=$PROG_TOTAL worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N record_hints=$([ "$RECORD_HINTS" = 1 ] && echo "$PRIOR_REC_N" || echo 0)$( [ "$PARALLEL" -ge 2 ] && printf ' parallel=%d window=%d' "$PARALLEL" "$PAR_WINDOW" || true )"
+  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} todo=$QUEUE_TOTAL total=$PROG_TOTAL worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N record_hints=$([ "$RECORD_HINTS" = 1 ] && echo "$PRIOR_REC_N" || echo 0)$( [ "$PARALLEL" -ge 2 ] && printf ' parallel=%d window=%d' "$PARALLEL" "$PAR_WINDOW" || true )$( [ "$SQUASH_ON" = 1 ] && echo ' squash=on' || true )"
 } | tee -a "$WALK_LOG"
 
 # ---- triage prefetch worker (config triage.enabled + triage.prefetch_ahead) ----
@@ -959,13 +1106,48 @@ count=0; last_short=""
 if [ "$PARALLEL" -ge 2 ]; then
   parallel_walk
 else
+  # ordered TODO slice: unprocessed commits, --limit applied (the squash
+  # planner must never glue a range that crosses the limit boundary)
+  TODO=(); limit_hit=0
   for sha in "${SHAS[@]}"; do
     [[ -v PROC["$sha"] ]] && continue
-    [ "$LIMIT" -gt 0 ] && [ "$count" -ge "$LIMIT" ] && { echo "Reached --limit $LIMIT; stopping." | tee -a "$WALK_LOG"; break; }
-    count=$((count+1)); QUEUE_POS=$count; last_short="${SHORT[$sha]:-??????????}"
-    PTAG="[$(prog_pos "$sha")] "
-    run_one "$sha" 2>&1 | tee -a "$WALK_LOG"
+    if [ "$LIMIT" -gt 0 ] && [ "${#TODO[@]}" -ge "$LIMIT" ]; then limit_hit=1; break; fi
+    TODO+=("$sha")
   done
+  [ "$limit_hit" = 1 ] && echo "Reached --limit $LIMIT; stopping." | tee -a "$WALK_LOG"
+  if [ "$SQUASH_ON" = 1 ] && [ "${#TODO[@]}" -gt 0 ]; then
+    todo_file="$(mktemp "$VERDICTS/.squash-todo.XXXXXX")"
+    printf '%s\n' "${TODO[@]}" > "$todo_file"
+    mapfile -t SPLAN < <(squash_plan "$todo_file")
+    rm -f "$todo_file"
+    if [ "${#SPLAN[@]}" -eq 0 ]; then
+      echo "squash: empty plan - per-commit walk" | tee -a "$WALK_LOG"
+    fi
+    for pline in "${SPLAN[@]}"; do
+      case "$pline" in
+        RANGE\ *)
+          read -r _kw _pn _prest <<<"$pline"
+          read -r -a _pm <<<"$_prest"
+          [ "${#_pm[@]}" -eq "$_pn" ] || die "squash: malformed plan line: $pline"
+          PTAG="[$(prog_pos "${_pm[0]}")] "
+          squash_range_session "${_pm[@]}" 2>&1 | tee -a "$WALK_LOG"
+          ;;
+        SINGLE\ *)
+          read -r _ps _psha <<<"$pline"
+          count=$((count+1)); QUEUE_POS=$count; last_short="${SHORT[$_psha]:-??????????}"
+          PTAG="[$(prog_pos "$_psha")] "
+          run_one "$_psha" 2>&1 | tee -a "$WALK_LOG"
+          ;;
+        *) die "squash: unknown plan line: $pline";;
+      esac
+    done
+  else
+    for sha in "${TODO[@]}"; do
+      count=$((count+1)); QUEUE_POS=$count; last_short="${SHORT[$sha]:-??????????}"
+      PTAG="[$(prog_pos "$sha")] "
+      run_one "$sha" 2>&1 | tee -a "$WALK_LOG"
+    done
+  fi
 fi
 
 # stop the prefetch worker before the summary: the walk is done, further triage

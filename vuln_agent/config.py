@@ -118,6 +118,28 @@ TRIAGE_DEFAULTS = {
 }
 
 
+# R2 range-squash (run.sh --squash, see vuln_agent/squash.py): runs of
+# guard-forced "probably irrelevant" commits are classified in ONE session
+# over the cumulative diff first^..tip; any non-NO_VULN answer splits the
+# range back into per-commit full sessions.
+SQUASH_DEFAULTS = {
+    "enabled": False,
+    # which guard-forced classes may join a squashed range:
+    #   "keyword" - the message matches the Pass B fix/security keywords (the
+    #               classic fix-keyword docs commit the cascade cannot clear)
+    #   "globs"   - every changed file matches triage.irrelevant_globs
+    "classes": ["keyword", "globs"],
+    # a run shorter than this stays per-commit (a range must pay for itself)
+    "min_series": 3,
+    # hard cap on members per range (attention-dilution bound)
+    "max_commits": 12,
+    # commits with a bigger INDIVIDUAL diff stay per-commit. 0 = limits.diff_chars
+    "member_diff_chars": 0,
+    # cumulative range diff cap (git diff first^..tip). 0 = AUTO: 2 x limits.diff_chars
+    "diff_chars": 0,
+}
+
+
 class ConfigError(Exception):
     """Fatal misconfiguration — the agent cannot start."""
 
@@ -258,6 +280,54 @@ def resolve_snapshot(config, llm):
         "max_modules": max_modules,
         "max_steps": max_steps,
     }
+
+
+def resolve_squash(config, limits=None):
+    """Merge the `squash` section (R2 range-squash) into a flat dict.
+
+    `limits` is the already-resolved limits dict (member/total diff caps
+    default from limits.diff_chars when the explicit keys are 0/absent).
+    """
+    section = config.get("squash")
+    if not isinstance(section, dict):
+        section = {}
+    merged = dict(SQUASH_DEFAULTS)
+    merged.update({k: v for k, v in section.items() if v not in (None, "")})
+    enabled = merged["enabled"]
+    if not isinstance(enabled, bool):
+        enabled = str(enabled).strip().lower() in ("true", "1", "yes", "on")
+    classes = merged["classes"]
+    if isinstance(classes, str):
+        classes = [c.strip() for c in classes.split(",") if c.strip()]
+    if not isinstance(classes, (list, tuple)) \
+            or not all(c in ("keyword", "globs") for c in classes):
+        raise ConfigError("squash.classes must be a subset of "
+                          "['keyword', 'globs']")
+    lim = limits if isinstance(limits, dict) else {}
+    base_diff = int(lim.get("diff_chars") or 0)
+    numbers = {}
+    for key in ("min_series", "max_commits", "member_diff_chars", "diff_chars"):
+        try:
+            numbers[key] = max(0, int(merged[key]))
+        except (TypeError, ValueError):
+            raise ConfigError("squash.%s must be an integer" % key)
+    numbers["min_series"] = max(2, numbers["min_series"])
+    numbers["max_commits"] = max(numbers["min_series"], numbers["max_commits"])
+    member_cap = numbers["member_diff_chars"] or base_diff
+    total_cap = numbers["diff_chars"] or 2 * base_diff
+    if enabled and total_cap <= 0:
+        raise ConfigError("squash needs limits.diff_chars > 0 or an explicit "
+                          "squash.diff_chars (0 disables diff injection, so a "
+                          "cumulative range diff cannot be sized)")
+    resolved = {
+        "enabled": enabled,
+        "classes": [str(c) for c in classes],
+    }
+    resolved.update(numbers)
+    # derived caps (AFTER numbers: the raw 0 = "auto" keys must not override)
+    resolved["member_diff_chars"] = member_cap
+    resolved["diff_chars_total"] = total_cap
+    return resolved
 
 
 def resolve_triage(config, llm):

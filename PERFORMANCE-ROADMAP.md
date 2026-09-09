@@ -109,14 +109,36 @@ wall −8% / prompt −33%; VULN wall −21% / prompt −39% / шаги −25%; 
   rate-limit шлюза (см. R5); поведение `--record-hints` (hint-коммиты —
   сразу в record-фазу).
 
-### R2. Адаптивный range-squash «неинтересных» участков
-N подряд идущих коммитов, где триаж ответил «нерелевантный», но guard требует
-полную сессию (fix-keyword docs-коммиты и т.п.), склеиваются в ОДНУ сессию по
-`git diff A..B`. Нашла что-то — откат к поштучному разбору диапазона.
-На типовой истории 30–50% коммитов — такой шум, сжатие 10–20:1.
-Эффект **~1.5–2×**. Реализация: режим в run.sh (сбор серии, диапазонный diff)
-+ пометка в cli (флаг «range-mode», в первом сообщении вместо per-commit diff
-— squashed + список SHAs).
+### R2. Адаптивный range-squash «неинтересных» участков  [РЕАЛИЗОВАНО]
+> Реализовано: `run.sh --squash` + конфиг `squash.*` + планировщик
+> `vuln_agent/squash.py` (чистый git-plumbing по source-клону, без LLM).
+> Серия ≥ `squash.min_series` (3) подряд идущих guard-forced коммитов —
+> класс "keyword" (сообщение матчит Pass-B keyword-regex — тот же
+> `triage.message_guarded`, что в каскаде) и/или класс "globs" (все файлы
+> под `triage.irrelevant_globs`) — склеивается в ОДНУ classify-only сессию
+> по кумулятивному диффу `first^..tip` (воркта на tip; кап
+> `squash.diff_chars`, 0 = авто = 2×`limits.diff_chars`; ≤
+> `squash.max_commits`=12 членов; индивидуальный дифф каждого ≤
+> `squash.member_diff_chars`=limits.diff_chars). Не кандидируются:
+> root/merge/R-D-коммиты, oversize-диффы, preseeded (--reuse-verdicts /
+> --skip-list), hint-коммиты и regex-скипы. `cli.py --squash-range` строит
+> первое сообщение: кумулятивные name-status + FULL DIFF + список SHAs с
+> сабджектами + правила SQUASHED RANGE MODE (Pass A по кумулятивному диффу;
+> Pass B — по каждому сабджекту с drill-down `git show -M`; NO_VULN только
+> если ВСЯ серия чистая; ANY finding/сомнение → VULN_UPDATED с пустым files).
+> Вердикт NO_VULN финализирует всех членов (маркер `NO_VULN(squash a..b)` в
+> verdicts — переиспользуется --reuse-verdicts); любой другой ответ — SPLIT:
+> поштучные record-сессии в порядке истории. Транскрипт/verdict json несут
+> `squash_range`. Только последовательный walk (с --parallel флаг честно
+> выключается с warn). Превью плана: `run.sh --list --squash`.
+ Идея: N подряд идущих коммитов, где триаж ответил «нерелевантный», но guard
+ требует полную сессию (fix-keyword docs-коммиты и т.п.), склеиваются в ОДНУ
+ сессию по `git diff A..B`. Нашла что-то — откат к поштучному разбору диапазона.
+ На типовой истории 30–50% коммитов — такой шум, сжатие 10–20:1.
+ Эффект **~1.5–2×** (в параллельном режиме почти весь выигрыш уже даёт R1).
+ Реализация: режим в run.sh (сбор серии, диапазонный diff) + пометка в cli
+ (флаг «range-mode», в первом сообщении вместо per-commit diff — squashed +
+ список SHAs).
 
 ### R3. Patch-id дедупликация вердиктов
 `git patch-id --stable` как ключ: cherry-picks/backports/reverts с идентичным
@@ -175,7 +197,12 @@ triage-level NO_VULN, либо полный NO_VULN с reconsider-раундом
    классифицируются вовсе — сразу в record-фазу (детерминированная
    гигиена записей и reconsider-раунд живут только там).
 2. Уровень доверия patch-id (только triage-NO_VULN или полный NO_VULN+hint). — открыто (R3)
-3. Порог склейки для R2 (например: серия ≥3, суммарный diff ≤ diff_chars×2). — открыто (R2)
+3. ~~Порог склейки для R2~~ (принято): серия ≥3 (`squash.min_series`), ≤12
+   коммитов на диапазон (`squash.max_commits`), кумулятивный дифф ≤
+   2×`limits.diff_chars` (`squash.diff_chars: 0` = авто), индивидуальный дифф
+   члена ≤ `limits.diff_chars` (`squash.member_diff_chars: 0` = авто).
+   Кандидаты — только классы "keyword"/"globs" (`squash.classes`); R/D, root,
+   merge, oversize и preseeded/hint коммиты серий не образуют.
 4. Формат records-дайджеста для R4 и лимит его размера. — открыто (R4)
 5. ~~Семантика `--stop-on-fail`/`--dry-run`/`--limit` при параллельных фазах~~
    (принято для R1): `--limit` ограничивает РЕПЛЕИ (окна не классифицируют

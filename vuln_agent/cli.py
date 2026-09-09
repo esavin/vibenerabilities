@@ -26,7 +26,7 @@ import sys
 
 from .agent import (PROVIDER_LIMIT_FILE, load_provider_limit, run_agent)
 from .config import (ConfigError, load_config, resolve_llm, resolve_limits,
-                     resolve_triage)
+                     resolve_squash, resolve_triage)
 from .hygiene import hygiene_plan
 from .llm import ChatClient, FatalLLMError
 from .prompt import (InspectError, build_first_user, build_reconsider_message,
@@ -56,6 +56,13 @@ def parse_args(argv):
                         help="directory for verdict files")
     parser.add_argument("--classify-only", action="store_true",
                         help="decide and report without writing records")
+    parser.add_argument("--squash-range", default="",
+                        help="comma-separated SHAs of a squashed range "
+                             "(oldest first; the LAST must equal --sha, the "
+                             "range tip). Runs ONE range classification "
+                             "session over the cumulative diff first^..tip: "
+                             "NO_VULN finalizes the whole range, anything "
+                             "else makes run.sh replay it commit-by-commit")
     parser.add_argument("--prior-verdict", default="",
                         help="verdict JSON from a previous run (VULN_UPDATED "
                              "hint; enables the reconsideration round)")
@@ -146,11 +153,25 @@ def main(argv=None):
         print("vuln-agent: --sha does not look like a commit hash", file=sys.stderr)
         return 2
 
+    squash_range = [s.strip() for s in (args.squash_range or "").split(",")
+                    if s.strip()]
+    if squash_range:
+        if len(squash_range) < 2 \
+                or any(not sha_looks_valid(s) for s in squash_range):
+            print("vuln-agent: --squash-range needs >= 2 valid comma-separated "
+                  "SHAs", file=sys.stderr)
+            return 2
+        if squash_range[-1] != args.sha:
+            print("vuln-agent: --squash-range must end with the --sha (tip) "
+                  "commit %s" % args.sha, file=sys.stderr)
+            return 2
+
     try:
         config = load_config(args.config)
         llm = resolve_llm(config, cli_model=args.model or None,
                           cli_max_steps=args.max_steps or None)
         limits = resolve_limits(config)
+        squash_cfg = resolve_squash(config, limits)
         triage = resolve_triage(config, llm)
     except ConfigError as exc:
         print("vuln-agent: %s" % exc, file=sys.stderr)
@@ -180,13 +201,21 @@ def main(argv=None):
 
     records_root = os.path.realpath(args.records_root)
     worktree = os.path.realpath(args.worktree)
-    mode = "classify-only" if args.classify_only else "record"
+    # a squashed-range session never writes records: it decides clean-vs-split
+    # (run.sh replays the range per-commit on anything but NO_VULN), so it is
+    # a classify-only session even without the explicit flag
+    classify_only = args.classify_only or bool(squash_range)
+    mode = "squash-range" if squash_range else (
+        "classify-only" if args.classify_only else "record")
+    if squash_range:
+        # the range diff injection cap (planner admitted the range under it)
+        limits["squash_diff_chars"] = squash_cfg["diff_chars_total"]
     today = datetime.date.today().isoformat()
     val_mode, val_rounds, path_check = validation_settings(config,
-                                                           args.classify_only)
+                                                           classify_only)
     sys_prompt = system_prompt()
 
-    tools = ToolSet(worktree, records_root, classify_only=args.classify_only,
+    tools = ToolSet(worktree, records_root, classify_only=classify_only,
                     limits=limits)
     client = ChatClient(
         base_url=llm["base_url"],
@@ -219,7 +248,7 @@ def main(argv=None):
         # RENAMED paths are rewritten in place before any LLM call, and a
         # remaining repair worklist bigger than hygiene_batch_records
         # records is split into per-batch sessions (hygiene.py)
-        if not args.classify_only:
+        if not classify_only:
             plan = hygiene_plan(worktree, args.sha, records_root,
                                 batch_records=int(
                                     limits.get("hygiene_batch_records") or 5))
@@ -232,7 +261,8 @@ def main(argv=None):
                                             mode, today,
                                             read_conventions(records_root,
                                                              limits),
-                                            limits=limits)
+                                            limits=limits,
+                                            squash_range=squash_range or None)
         old_paths = info["old_paths"]
         root_commit = info["is_root"]
         changed = info.get("changed", 0)
@@ -259,7 +289,7 @@ def main(argv=None):
         if prior_hint is not None:
             def reconsider(hint=prior_hint):
                 message = build_reconsider_message(hint,
-                                                   args.classify_only)
+                                                   classify_only)
                 reconsider_state["fired"] = bool(message)
                 return message
             log("prior-run hint loaded: %d record(s) eligible for "
@@ -351,9 +381,11 @@ def main(argv=None):
         # without the full session. Every guard - root commit, renames/
         # deletes, hygiene worklist, prior-run hint, fix/security keywords,
         # oversized diff, unparsable reply - falls through to the FULL
-        # session below, so recall is preserved.
+        # session below, so recall is preserved. Skipped for squashed-range
+        # sessions: the range session IS the triage (with tools).
         triage_skip = None
         if (triage["enabled"] and reconsider is None
+                and not squash_range
                 and not batches
                 and not (plan and (plan["prepass_edited"]
                                    or plan["stale_by_record"]))):
@@ -381,7 +413,8 @@ def main(argv=None):
             if transcript is not None:
                 transcript.close()
         else:
-            record_session()
+            record_session({"squash_range": squash_range}
+                           if squash_range else None)
             session_verdicts = []
             wrote_records = False
             try:
@@ -396,7 +429,7 @@ def main(argv=None):
                         focus={"batch": index + 1, "batches": len(batches),
                                "stale": batch})
                     batch_tools = ToolSet(worktree, records_root,
-                                          classify_only=args.classify_only,
+                                          classify_only=classify_only,
                                           limits=limits)
                     record_session({"batch": "%d/%d" % (index + 1, len(batches)),
                                     "focus_records": list(batch_records),
@@ -486,7 +519,7 @@ def main(argv=None):
         # final validation state (the validator callback tracks the last
         # run); gated on ANY records change this invocation - agent
         # sessions, the deterministic rename pre-pass, or both
-        if (val_mode != "off" and not args.classify_only
+        if (val_mode != "off" and not classify_only
                 and (wrote_records or prepass_edited)):
             problems = validate_records(records_root, worktree, old_paths,
                                         path_check)
@@ -512,6 +545,10 @@ def main(argv=None):
     verdict["mode"] = mode
     verdict["sha"] = args.sha
     verdict["root_commit"] = root_commit
+    if squash_range:
+        verdict["squash_range"] = {"first": squash_range[0],
+                                   "tip": squash_range[-1],
+                                   "commits": len(squash_range)}
     if reconsider_state["fired"]:
         verdict["reconsidered"] = True
     if transcript is not None:

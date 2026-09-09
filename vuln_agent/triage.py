@@ -88,6 +88,14 @@ _DECISION_RE = re.compile(
     r"\b(SECURITY_RELEVANT|CLEARLY_IRRELEVANT)\b")
 
 
+def message_guarded(message):
+    """True when the commit message matches the Pass B fix/security keyword
+    list - the same word-boundary regex the triage cascade uses to force the
+    full session. Shared with the R2 squash planner (vuln_agent.squash) so
+    run.sh-side candidate detection and the cascade can never drift apart."""
+    return bool(_PASS_B_KEYWORDS.search(message or ""))
+
+
 def _git(worktree, argv):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
@@ -305,7 +313,7 @@ def run_triage(client, worktree, sha, cfg, log,
     subject = _git(worktree, ["log", "-1", "--format=%s", sha]).strip()
     message = _git(worktree, ["log", "-1", "--format=%B", sha]).strip()
 
-    if _PASS_B_KEYWORDS.search(message or ""):
+    if message_guarded(message):
         return refuse("commit message matches fix/security keywords")
 
     diff = _git(worktree, ["diff", "-M", parent, sha]).strip("\n")
