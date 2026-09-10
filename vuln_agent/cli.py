@@ -177,27 +177,35 @@ def main(argv=None):
         print("vuln-agent: %s" % exc, file=sys.stderr)
         return 2
 
-    # seed the compaction threshold from a provider limit discovered by an
-    # EARLIER session (verdicts/provider-limit.json): each session otherwise
-    # re-pays one context-overflow HTTP 400 before adapting. Only applies
-    # while compaction is otherwise off - an explicit
-    # limits.compact_threshold_tokens always wins, and the stored window is
+    # arm the pre-flight overflow guard from a provider limit discovered by
+    # an EARLIER session (verdicts/provider-limit.json): each session
+    # otherwise re-pays one context-overflow HTTP 400 before adapting. The
+    # window itself seeds the guard REGARDLESS of compaction settings - an
+    # explicit limits.compact_threshold_tokens only overrides WHEN history
+    # compaction triggers, never WHETHER over-size requests are shrunk
+    # before being sent (a threshold above 82% of the window would fire
+    # too late, so it is lowered to that ceiling). The stored window is
     # ignored once model/endpoint change.
     limit_state_path = os.path.join(args.verdicts_dir, PROVIDER_LIMIT_FILE)
-    if not limits.get("compact_threshold_tokens"):
-        known = load_provider_limit(limit_state_path, model=llm["model"],
-                                    base_url=llm["base_url"])
-        if known:
-            limits["compact_threshold_tokens"] = max(1000, int(known * 0.82))
-            # also expose the window itself: agent.py uses it for the
-            # pre-flight overflow guard (a single tool round can add more
-            # tokens than the headroom below the window - shrink before
-            # sending instead of paying the 400 round-trip first)
-            limits["provider_input_limit"] = known
+    known = load_provider_limit(limit_state_path, model=llm["model"],
+                                base_url=llm["base_url"])
+    if known:
+        limits["provider_input_limit"] = known
+        safe = max(1000, int(known * 0.82))
+        if not limits.get("compact_threshold_tokens"):
+            limits["compact_threshold_tokens"] = safe
             log("compaction threshold seeded to %d tokens from persisted "
                 "provider limit %d (%s)"
-                % (limits["compact_threshold_tokens"], known,
+                % (safe, known, PROVIDER_LIMIT_FILE))
+        elif limits["compact_threshold_tokens"] > safe:
+            log("compaction threshold %d lowered to %d tokens from persisted "
+                "provider limit %d (%s)"
+                % (limits["compact_threshold_tokens"], safe, known,
                    PROVIDER_LIMIT_FILE))
+            limits["compact_threshold_tokens"] = safe
+        else:
+            log("pre-flight overflow guard armed from persisted provider "
+                "limit %d (%s)" % (known, PROVIDER_LIMIT_FILE))
 
     records_root = os.path.realpath(args.records_root)
     worktree = os.path.realpath(args.worktree)
