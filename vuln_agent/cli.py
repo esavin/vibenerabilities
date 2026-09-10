@@ -274,6 +274,9 @@ def main(argv=None):
         old_paths = info["old_paths"]
         root_commit = info["is_root"]
         changed = info.get("changed", 0)
+        if info.get("preloaded"):
+            log("preload: %d changed file body(ies) injected into the first "
+                "message" % info["preloaded"])
     except InspectError as exc:
         verdict = {"verdict": "ERROR", "files": [], "reason":
                    "cannot-inspect-commit: %s" % exc, "steps": 0,
@@ -352,6 +355,17 @@ def main(argv=None):
             # wander.
             boost = min(max(0, llm["max_steps_cap"] - max_steps), changed // 8)
             max_steps += boost
+        # classify-only sessions get a hard step budget: a NO_VULN
+        # classification is a pure function of the commit, so a session that
+        # cannot conclude within classify_max_steps steps was wandering - its
+        # ERROR verdict safely falls back to a full record session (the
+        # parallel replay ignores it; a squash range splits). Root-commit
+        # snapshot scans keep their deeper budget.
+        classify_cap = int(limits.get("classify_max_steps") or 0)
+        if classify_only and not root_commit and classify_cap > 0:
+            bound = classify_cap * 2 if squash_range else classify_cap
+            if max_steps > bound:
+                max_steps = bound
         limits_label = limits["profile"]
         if limits["compact_threshold_tokens"]:
             limits_label += " (compact >= %d tokens)" % limits["compact_threshold_tokens"]
@@ -510,6 +524,14 @@ def main(argv=None):
             verdict["verdict"] = "ERROR"
             verdict["files"] = []
             verdict["reason"] = failed[0].get("reason") or "session failed"
+        if (mode != "record" and verdict["verdict"] == "ERROR"
+                and "max_steps" in (verdict.get("reason") or "")):
+            # classify step budget exhausted: not a pipeline failure - the
+            # outer loop safely replays this commit/range with full record
+            # sessions (recall before speed)
+            verdict["reason"] = ("classify step budget exhausted (%s) - "
+                                 "replay with a full record session"
+                                 % (verdict.get("reason") or "").strip())
         elif files and verdict["verdict"] == "NO_VULN":
             # records changed this invocation (pre-pass / batches) - never
             # report NO_VULN with dirty records on disk

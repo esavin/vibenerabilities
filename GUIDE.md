@@ -458,7 +458,9 @@ fields in the template explain each):
 | `limits.diff_chars` | full-diff injection cap (whole or not at all; 0 disables) | `16000` |
 | `limits.compact_threshold_tokens` | history-compaction trigger (0 = off) | `0` |
 | `limits.compact_keep_groups` / `compact_result_chars` | compaction: rounds kept verbatim / shrunk size | `4` / `2000` |
-| other `limits.*` caps | per-blob caps: `diffstat_chars`, `name_status_chars`, `tree_digest_chars`, `conventions_chars`, `records_overview_chars`, `tool_result_chars`, `git_output_chars`, `read_file_chars`, `list_dir_chars` | see template |
+| `limits.classify_max_steps` | hard step budget for classify-only / squash-range sessions (budget exhausted → ERROR verdict → safe fallback to a full record session; 0 = off; root-commit scans exempt) | `8` |
+| `limits.preload_file_chars` / `preload_total_chars` / `preload_max_files` | preload FULL bodies of the most-touched small changed files into the first user message (kills read_file round-trips; total 0 disables) | `6000` / `24000` / `8` |
+| other `limits.*` caps | per-blob caps: `diffstat_chars`, `name_status_chars`, `tree_digest_chars`, `conventions_chars`, `records_overview_chars`, `tool_result_chars`, `git_output_chars`, `read_file_chars` (also the per-read default window — read_file returns ≤400 lines unless `limit` is explicit), `list_dir_chars` | see template |
 | `snapshot.planner_model` | model for the one planner request (`""` = `llm.model`) | `""` |
 | `snapshot.max_modules` | cap on the module partition (excess merges into "misc") | `40` |
 | `snapshot.max_steps` | per-module step budget (0 = `llm.max_steps_initial`) | `0` |

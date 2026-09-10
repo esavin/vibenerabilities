@@ -18,11 +18,15 @@
   "$comment_scope": "Optional pathspec: analyze only commits touching this subdirectory (e.g. 'src/'). Empty = whole tree.",
 
   "limits": {
-    "$comment": "Context budget. profile 'default' = historical caps, compaction off. profile 'small' = preset for ~32k-context models: tighter caps on every injected blob plus history compaction (once a request reports prompt_tokens >= compact_threshold_tokens, older tool results are shrunk in place to compact_result_chars; the last compact_keep_groups rounds stay verbatim). Any explicit key here overrides the profile. Tune compact_threshold_tokens to your window (leave headroom for the reply).",
+    "$comment": "Context budget. profile 'default' = measured caps (see vuln_agent/config.py), compaction off. profile 'small' = preset for ~32k-context models: tighter caps on every injected blob plus history compaction (once a request reports prompt_tokens >= compact_threshold_tokens, older tool results are shrunk in place to compact_result_chars; the last compact_keep_groups rounds stay verbatim). Any explicit key here overrides the profile. Tune compact_threshold_tokens to your window (leave headroom for the reply).",
     "profile": "default",
     "tool_result_chars": 100000,
     "git_output_chars": 150000,
-    "read_file_chars": 80000,
+    "read_file_chars": 24000,
+    "classify_max_steps": 8,
+    "preload_file_chars": 6000,
+    "preload_total_chars": 24000,
+    "preload_max_files": 8,
     "list_dir_chars": 40000,
     "diffstat_chars": 30000,
     "diff_chars": 16000,

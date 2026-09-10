@@ -24,6 +24,14 @@ RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 # 16 minutes between HTTP-level retries instead of burning them within seconds.
 HTTP_BACKOFF_SECONDS = (60, 120, 240, 480, 960)
 
+# Gateways occasionally misroute one request and answer 404 "page not found"
+# while the very same endpoint keeps serving the neighbouring requests
+# (observed: neuraldeep.ru mid-session, killed the commit's verdict). Those
+# glitches clear within a minute, so they retry on a fast rising curve that
+# shares the ordinary retry budget instead of the patient outage schedule.
+TRANSIENT_HTTP = {404}
+TRANSIENT_BACKOFF_SECONDS = (5, 10, 20, 40, 120)
+
 # HTTP 400 bodies that mean "input exceeds the context/token window".
 # neuraldeep.ru reports in Russian ("Слишком длинный запрос: N токенов входа
 # при пределе M"); OpenAI/vLLM/others send English variants.
@@ -407,6 +415,14 @@ class ChatClient(object):
                         raise ContextOverflowError(
                             "HTTP 400 from %s: %s" % (self.url, detail),
                             _context_limit(detail))
+                    if status in TRANSIENT_HTTP and attempt < self.retries:
+                        last_error = "HTTP %d: %s" % (status, detail)
+                        delay = self._backoff(attempt, None, transient=True)
+                        _log("HTTP %d from %s - retry %d/%d in %.0fs"
+                             % (status, self.model, attempt + 1,
+                                self.retries, delay))
+                        time.sleep(delay)
+                        continue
                     if status in RETRYABLE_HTTP and attempt < self.retries:
                         last_error = "HTTP %d: %s" % (status, detail)
                         delay = self._backoff(attempt,
@@ -460,15 +476,20 @@ class ChatClient(object):
         return payload
 
     @staticmethod
-    def _backoff(attempt, retry_after, http=False):
+    def _backoff(attempt, retry_after, http=False, transient=False):
         """Wait before the next retry.
 
         HTTP-level failures (503 "no available server", overloads) are far
         longer-lived than connection resets, so they follow a patient fixed
         schedule (1, 2, 4, 8, 16 minutes); an explicit Retry-After header wins,
-        capped at the schedule maximum. Connection errors keep the fast
-        exponential curve (they are almost always transient).
+        capped at the schedule maximum. Transient misroutes (404) use a fast
+        rising curve (5..120 s) and ignore Retry-After, which 404 error pages
+        never set meaningfully. Connection errors keep the fast exponential
+        curve (they are almost always transient).
         """
+        if transient:
+            index = min(attempt, len(TRANSIENT_BACKOFF_SECONDS) - 1)
+            return float(TRANSIENT_BACKOFF_SECONDS[index])
         try:
             if retry_after:
                 return min(HTTP_BACKOFF_SECONDS[-1], float(retry_after))

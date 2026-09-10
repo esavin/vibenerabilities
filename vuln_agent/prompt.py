@@ -29,6 +29,10 @@ show old -> new paths; deletions (D) show the removed path.
 - FULL DIFF (when present): the complete rename-aware diff of this commit. When \
 present, the whole change is already in front of you - do NOT re-fetch it with \
 `git show`; read worktree files only when you need surrounding context.
+- PRELOADED FILE CONTENTS (when present): complete bodies of the most-touched \
+changed files as they exist at this commit. Analyze them directly - do NOT \
+re-read these files with read_file; anything not preloaded is available via \
+read_file as usual.
 - SQUASHED RANGE MODE (when present): this ONE session classifies a RANGE of \
 commits at once. The RANGE COMMITS listing shows every member (oldest first); \
 the FULL DIFF is the cumulative first-parent..tip change over the whole range. \
@@ -742,6 +746,109 @@ def squash_range_section(shas, first_parent):
     return "\n".join(lines)
 
 
+def preload_files_section(worktree, base, sha, lim, include_added=False):
+    """PRELOADED FILE CONTENTS: full bodies of the most-touched small files
+    changed between `base` and `sha`, read from the worktree (which stands
+    at `sha`).
+
+    Kills the read_file round-trips a session otherwise spends fetching the
+    context around diff hunks: every preloaded file rides in the FIRST
+    request once instead of a round-trip per file (each round-trip re-sends
+    the whole conversation). Selection: modified files and modified renames
+    always (the diff shows hunks only); added files only when the full diff
+    was NOT injected (for adds the diff already IS the complete file). Pure
+    renames (R100) carry no content change and are skipped. Most-touched
+    files first (numstat adds+dels). Caps: preload_file_chars per file (a
+    larger file is skipped whole - a partial body misleads),
+    preload_total_chars overall, preload_max_files. 0 total disables.
+    Returns (section_text, n_files).
+    """
+    total_cap = int((lim or {}).get("preload_total_chars") or 0)
+    if total_cap <= 0:
+        return "", 0
+    file_cap = max(500, int(lim.get("preload_file_chars") or 6000))
+    max_files = max(1, int(lim.get("preload_max_files") or 8))
+
+    candidates = []
+    raw = _git_ok(worktree, ["diff", "--name-status", "-M", base, sha])
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        status = parts[0]
+        if status.startswith("R") and len(parts) >= 3:
+            score = status[1:]
+            if score.isdigit() and int(score) >= 100:
+                continue  # pure rename: no content to preload
+            candidates.append(parts[2])
+        elif status.startswith("M"):
+            candidates.append(parts[-1])
+        elif include_added and status.startswith("A"):
+            candidates.append(parts[-1])
+    if not candidates:
+        return "", 0
+
+    sizes = {}
+    for line in _git_ok(worktree, ["diff", "--numstat", "-M", base,
+                                   sha]).splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            try:
+                sizes[parts[2]] = int(parts[0]) + int(parts[1])
+            except ValueError:
+                pass
+    # unsized paths (numstat prints rename-format lines like "{a => b}/c")
+    # sort last but stay eligible, name-ordered for determinism
+    ordered = sorted(set(candidates), key=lambda p: (-sizes.get(p, -1), p))
+
+    chunks = []
+    used = 0
+    skipped = 0
+    for path in ordered:
+        if len(chunks) >= max_files or used >= total_cap:
+            skipped += 1
+            continue
+        real = os.path.join(worktree, path)
+        body = None
+        try:
+            if not os.path.isfile(real):
+                continue
+            if os.path.getsize(real) > file_cap:
+                skipped += 1
+                continue
+            with open(real, "rb") as fh:
+                head = fh.read(4096)
+            if b"\x00" in head:
+                continue  # binary
+            with open(real, "r", encoding="utf-8", errors="replace") as fh:
+                body = fh.read(file_cap + 1)
+        except OSError:
+            continue
+        if body is None or len(body) > file_cap:
+            skipped += 1
+            continue
+        if body and body.count("\ufffd") > 0.10 * len(body):
+            continue  # binary or non-UTF-8
+        if not body.strip():
+            continue
+        cost = len(body) + len(path) + 32
+        if used + cost > total_cap:
+            skipped += 1
+            continue
+        chunks.append("--- %s ---\n%s" % (path, body.rstrip("\n")))
+        used += cost
+    if not chunks:
+        return "", 0
+    note = ("complete files as they exist at this commit, most-touched first - "
+            "analyze them directly, do NOT re-read them with read_file; "
+            "files not shown are available via read_file as usual")
+    if skipped:
+        note += " - %d more changed file(s) skipped over the preload size/" \
+                "count budget" % skipped
+    return ("PRELOADED FILE CONTENTS (%s):\n%s" % (note, "\n\n".join(chunks)),
+            len(chunks))
+
+
 def build_first_user(sha, worktree, records_root, mode, today, conventions,
                      limits=None, focus=None, squash_range=None):
     """Build the first user message. Returns (text, info) where info carries
@@ -766,6 +873,7 @@ def build_first_user(sha, worktree, records_root, mode, today, conventions,
     root = is_root_commit(worktree, sha)
     old_paths = []
     changed = 0
+    preloaded = 0
     sections = []
 
     if squash_range:
@@ -788,6 +896,7 @@ def build_first_user(sha, worktree, records_root, mode, today, conventions,
         diff_cap = int(lim.get("squash_diff_chars")
                        or lim.get("diff_chars") or 0)
         diff = _git_ok(worktree, ["diff", "-M", first_parent, sha]).strip("\n")
+        diff_injected = False
         if diff and diff_cap > 0 and len(diff) <= diff_cap:
             sections.append(
                 "FULL DIFF (CUMULATIVE %s..%s - the COMPLETE change over the "
@@ -795,12 +904,18 @@ def build_first_user(sha, worktree, records_root, mode, today, conventions,
                 "the range is invisible here):\n%s"
                 % (first_parent[:10], sha[:10], diff)
             )
+            diff_injected = True
         else:
             sections.append(
                 "FULL DIFF: the cumulative range diff does not fit here - "
                 "fetch per-commit diffs with `git show -M <sha>` from the "
                 "RANGE COMMITS listing."
             )
+        preload, preloaded = preload_files_section(
+            worktree, first_parent, sha, lim,
+            include_added=not diff_injected)
+        if preload:
+            sections.append(preload)
         sections.append("RANGE COMMITS (%d, oldest first):\n%s"
                         % (len(squash_range),
                            "\n".join(_range_listing(worktree, squash_range))))
@@ -841,6 +956,7 @@ def build_first_user(sha, worktree, records_root, mode, today, conventions,
         # truncated diff would look complete but is not. 0 disables. Skipped
         # in focus mode (path-hygiene repair needs the moves, not the diff).
         diff_cap = int(lim.get("diff_chars") or 0)
+        diff_injected = False
         if diff_cap > 0 and parent and focus is None:
             diff = _git_ok(worktree, ["diff", "-M", parent, sha]).strip("\n")
             if diff and len(diff) <= diff_cap:
@@ -849,6 +965,12 @@ def build_first_user(sha, worktree, records_root, mode, today, conventions,
                     "nothing truncated; run your three detection passes on it "
                     "directly, no need to re-fetch with git show):\n%s" % diff
                 )
+                diff_injected = True
+        if parent and focus is None:
+            preload, preloaded = preload_files_section(
+                worktree, parent, sha, lim, include_added=not diff_injected)
+            if preload:
+                sections.append(preload)
 
     if focus is not None:
         sections.append(focus_section(focus))
@@ -926,7 +1048,7 @@ def build_first_user(sha, worktree, records_root, mode, today, conventions,
             "Begin: inspect the commit, run the three detection passes, update the "
             "records map if warranted, then call finish.")
     return "\n".join(parts), {"is_root": root, "old_paths": old_paths,
-                              "changed": changed}
+                              "changed": changed, "preloaded": preloaded}
 
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{4,40}$")

@@ -35,7 +35,14 @@ GIT_FORBIDDEN_EXACT = {"-c", "--output", "--ext-diff", "--textconv",
 GIT_FORBIDDEN_PREFIXES = ("--output=", "-O", "--git-dir", "--work-tree")
 GIT_TIMEOUT_SECONDS = 60
 MAX_GIT_CHARS = 150_000
-MAX_READ_CHARS = 80_000
+# default-profile cap for one read_file result: read results stay verbatim
+# in the session history (re-sent on every later round-trip), and measured
+# runs show ~8% of reads carrying ~40% of the volume - trim the tail, the
+# model continues with explicit offset/limit when it needs more
+MAX_READ_CHARS = 24_000
+# default line budget for one read_file call without an explicit limit:
+# a wandering session that reads 30+ files pays this per call
+MAX_READ_LINES = 400
 MAX_LINE_CHARS = 2_000
 MAX_LIST_ENTRIES = 3_000
 MAX_LIST_CHARS = 40_000
@@ -174,7 +181,11 @@ class ToolSet(object):
                     "description": (
                         "Read a text file from the commit worktree or the records root. "
                         "Use an absolute path, or a path relative to one of those roots. "
-                        "Returns numbered lines."
+                        "Returns numbered lines. Without an explicit limit returns up to "
+                        "400 lines starting at offset; total_lines/more in the result say "
+                        "how to continue (pass offset/limit) - never re-read the same "
+                        "window. If the file's CHANGED REGION is what you need, read "
+                        "around the diff hunk line numbers, not the whole file."
                     ),
                     "parameters": {
                         "type": "object",
@@ -471,7 +482,7 @@ class ToolSet(object):
                 return {"ok": False, "error": "binary or non-UTF-8 file"}
         try:
             offset = int(args.get("offset") or 1)
-            limit = min(int(args.get("limit") or 1200), 5000)
+            limit = min(int(args.get("limit") or MAX_READ_LINES), 5000)
         except (TypeError, ValueError):
             return {"ok": False, "error": "offset/limit must be integers"}
         offset = max(1, offset)
@@ -487,7 +498,8 @@ class ToolSet(object):
             numbered.append("%d: %s" % (index, line))
             total += len(numbered[-1]) + 1
             if total > self.read_file_chars:
-                numbered.append("... [output truncated at %d chars]" % self.read_file_chars)
+                numbered.append("... [output truncated at %d chars - continue "
+                                "with offset/limit]" % self.read_file_chars)
                 break
         return {
             "ok": True,

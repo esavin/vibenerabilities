@@ -31,10 +31,29 @@ LIMIT_DEFAULTS = {
     "profile": "default",
     # per tool result kept in the session history (agent.py append-time cap)
     "tool_result_chars": 100_000,
-    # per-tool output caps inside ToolSet (tools.py)
+    # per-tool output caps inside ToolSet (tools.py). read_file_chars also
+    # bounds the DEFAULT read (no explicit limit): a wandering session that
+    # reads 30+ files re-sends every result on each later round-trip, so the
+    # 8% biggest reads carrying ~40% of the volume are worth trimming.
     "git_output_chars": 150_000,
-    "read_file_chars": 80_000,
+    "read_file_chars": 24_000,
     "list_dir_chars": 40_000,
+    # classify-only sessions (--classify-only / --squash-range workers):
+    # hard step budget. A NO_VULN classification is a pure function of the
+    # commit - a session that cannot conclude within this many steps was
+    # wandering, and its ERROR verdict safely falls back to a full record
+    # session (parallel: replay ignores it; squash: the range splits).
+    # 0 disables (llm.max_steps applies). Not applied to root-commit scans.
+    "classify_max_steps": 8,
+    # preload FULL bodies of the most-touched small changed files into the
+    # first user message (prompt.py): kills the read_file round-trips the
+    # agent otherwise spends re-fetching context around the diff hunks.
+    # Per-file / total char caps and a file-count cap; a file larger than
+    # preload_file_chars is skipped whole (a partial body misleads).
+    # preload_total_chars = 0 disables.
+    "preload_file_chars": 6_000,
+    "preload_total_chars": 24_000,
+    "preload_max_files": 8,
     # first-user-message injection caps (prompt.py)
     "diffstat_chars": 30_000,
     # full-diff injection into the first user message: the diff is injected
@@ -66,7 +85,7 @@ LIMIT_PROFILES = {
     "small": {
         "tool_result_chars": 24_000,
         "git_output_chars": 30_000,
-        "read_file_chars": 24_000,
+        "read_file_chars": 16_000,
         "list_dir_chars": 16_000,
         "diffstat_chars": 10_000,
         "diff_chars": 12_000,
@@ -77,6 +96,9 @@ LIMIT_PROFILES = {
         "compact_threshold_tokens": 20_000,
         "compact_keep_groups": 3,
         "compact_result_chars": 1_500,
+        "preload_file_chars": 4_000,
+        "preload_total_chars": 12_000,
+        "preload_max_files": 6,
     },
 }
 
