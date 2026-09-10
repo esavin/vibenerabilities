@@ -79,6 +79,8 @@ HUB_SECTION_KEYS = (("finding", "findings"), ("summary", "summary"))
 _PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.@/\-])[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)+")
 _FILE_EXT_RE = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,4}$")
 _LINK_RE = re.compile(r"!?\[([^\]]*)\]\(\s*<?([^)>]+?)>?\s*\)")
+_FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 _SKIP_PREFIXES = ("http://", "https://", "mailto:", "ftp://", "#", "data:", "//")
 _SKIP_TOKEN_CONTAINS = ("<", ">", "@@", "...", "*", "://")
 _PLACEHOLDER_FIRST = {
@@ -238,6 +240,30 @@ def _read(path):
         return ""
 
 
+def _strip_code(text):
+    """Blank out fenced code blocks and inline code spans before markup
+    checks: markdown inside code is literal text, not markup. Without this,
+    a quoted Go generics call ('parseArgs[runCommandArgs](jsonArgs)') matches
+    _LINK_RE as a fake '[runCommandArgs](jsonArgs)' link and fails link
+    validation with a bogus 'broken link' error."""
+    out = []
+    fence = None  # fence character while inside a block, else None
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if fence is None:
+            opener = _FENCE_RE.match(stripped)
+            if opener:
+                fence = opener.group(1)[0]
+                out.append("")
+                continue
+            out.append(line)
+        else:
+            if stripped.startswith(fence * 3):
+                fence = None
+            out.append("")
+    return _INLINE_CODE_RE.sub(" ", "\n".join(out))
+
+
 def check_layout(records_root, warnings):
     allowed = RECORDS_TOP_FILES | RECORDS_TOP_DIRS
     allowed_l = {name.lower() for name in allowed}
@@ -322,7 +348,7 @@ def check_links(records_root, errors):
     for path in _iter_md_files(records_root):
         rel = _rel(path, records_root)
         base = os.path.dirname(path)
-        for match in _LINK_RE.finditer(_read(path)):
+        for match in _LINK_RE.finditer(_strip_code(_read(path))):
             target = match.group(2).strip()
             if not target or target.startswith(_SKIP_PREFIXES):
                 continue
@@ -420,7 +446,7 @@ def check_orphans(records_root, warnings):
     hub = os.path.join(records_root, HUB)
     if not os.path.isfile(hub):
         return
-    text = _read(hub)
+    text = _strip_code(_read(hub))
     linked = set()
     for match in _LINK_RE.finditer(text):
         target = match.group(2).strip()
