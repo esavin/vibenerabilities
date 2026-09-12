@@ -247,6 +247,25 @@ silently lost their INDEX.md row; all of it is mechanically checkable:
   (`CLASSIFY` lines). Expected speedup at 12–15% VULN commits with K=6–8: ~3–4x —
   the ceiling is the serialized VULN tape (0.15 × N × ~250s), so raise K only while
   classify lines still dominate `walk.log`.
+  **Adaptive rate limits** (`parallel.adaptive`, default on): K is only the ceiling
+  you configure — the pipeline discovers the provider's real budget on its own.
+  Every agent process (classify worker, record session, prefetch worker) appends
+  one JSON line to `verdicts/ratelimit-events.jsonl` for each retried HTTP request;
+  the classify batch's AIMD controller counts new HTTP 429 events before each
+  spawn and halves the effective worker count on each event batch (repeatedly when
+  several arrive at once — a saturated endpoint 429s many workers within one spawn
+  interval), floored at `parallel.min_workers` (default 1). After `eff` cleanly
+  finished sessions the count climbs back by one, capped at K — spawns are
+  never credited, so an endpoint that 429s every session stays pinned at the
+  floor instead of oscillating. A running record
+  session reserves one slot (marker `verdicts/.record-inflight`), so at most
+  `eff` request streams hit the endpoint. In-flight workers are never killed —
+  their own
+  client retries (60s+ backoff, Retry-After honoured) ride out the burst while the
+  NEXT spawn is gated. Adaptation lines land in `walk.log`
+  (`parallel: HTTP 429 (xN) -> classify workers A -> B` / `clean round done ->
+  ...`); the effective count persists across windows within a run and resets to
+  the ceiling on the next run. `parallel.adaptive: false` pins K at the ceiling.
 - **Range-squash for guard-forced noise** (`--squash`, or config `squash.enabled`;
   sequential walk only): a NO_VULN on a "probably irrelevant" commit is the common
   outcome of a full multi-step session the triage cascade could not skip — the classic
