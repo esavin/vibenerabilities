@@ -12,6 +12,7 @@ rest of the package.
 
 import http.client
 import json
+import os
 import random
 import re
 import threading
@@ -20,6 +21,13 @@ import urllib.parse
 import urllib.request
 
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+
+# Shared rate-limit telemetry: when the env names a file (run.sh exports it
+# for every agent process it spawns), each retried HTTP-level request appends
+# one JSON line {"ts","status","retry","delay","model"} to it. The --parallel
+# AIMD controller in run.sh tails this file and shrinks concurrency on
+# HTTP 429 bursts. Unset (manual runs) -> no telemetry, no behaviour change.
+RATE_EVENTS_ENV = "VULN_RATE_EVENTS"
 # Provider outages (503 "no available server") span minutes: wait 1, 2, 4, 8,
 # 16 minutes between HTTP-level retries instead of burning them within seconds.
 HTTP_BACKOFF_SECONDS = (60, 120, 240, 480, 960)
@@ -428,6 +436,7 @@ class ChatClient(object):
                         delay = self._backoff(attempt,
                                               headers.get("Retry-After"),
                                               http=True)
+                        self._note_rate_event(status, attempt + 1, delay)
                         _log("HTTP %d from %s - retry %d/%d in %.0fs"
                              % (status, self.model, attempt + 1,
                                 self.retries, delay))
@@ -474,6 +483,26 @@ class ChatClient(object):
         for key, value in self.extra_body.items():
             payload.setdefault(key, value)
         return payload
+
+    def _note_rate_event(self, status, retry, delay):
+        """Append one JSON line to the shared rate-limit events file.
+
+        Best-effort telemetry for the orchestrator's adaptive-concurrency
+        control: write failures (unwritable path, disk full) are swallowed -
+        telemetry must never kill a session. One small O_APPEND write per
+        event keeps concurrent agent processes from clobbering each other.
+        """
+        path = os.environ.get(RATE_EVENTS_ENV)
+        if not path:
+            return
+        try:
+            line = json.dumps({"ts": round(time.time(), 3), "status": status,
+                               "retry": retry, "delay": delay,
+                               "model": self.model}) + "\n"
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass
 
     @staticmethod
     def _backoff(attempt, retry_after, http=False, transient=False):

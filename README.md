@@ -156,6 +156,17 @@ false NO_VULN, and duplicates collapse in the record phase. Window size
 session are in flight at most. Expected speedup at 12–15% VULN commits and
 K=6–8: ~3–4x (the ceiling is the serialized record tape).
 
+**Adaptive rate limits** (on by default): K is only the **ceiling** — every
+agent process logs its retried HTTP requests to
+`verdicts/ratelimit-events.jsonl` (llm.py), and an AIMD controller halves
+the effective number of concurrent sessions whenever the endpoint answers
+HTTP 429 (floor `parallel.min_workers`), then adds one back per round of
+clean sessions (cap K). A running record session reserves one slot, so the
+provider never sees more than the current budget. Set the ceiling
+generously and let the pipeline discover the provider's real limit;
+`parallel.adaptive: false` pins K. Watch `parallel: HTTP 429 (xN) ->
+classify workers A -> B` lines in `walk.log`.
+
 A failed commit (LLM outage, timeout, validation error) rolls the baseline back to its
 parent and is requeued automatically on the next run — nothing is ever silently skipped.
 
@@ -222,12 +233,15 @@ accepted. See `GUIDE.md` for the full semantics.
                        it back into per-commit sessions (config squash.*;
                        sequential walk only, preview with --list --squash)
   --parallel [K]       classify-ahead: K workers (default 4, config
-                       parallel.workers) pre-classify windows of commits
-                       (config parallel.window, default 32) in classify-only
-                       mode against a records snapshot; the main process
-                       replays each window in history order — classified
-                       NO_VULN commits are final, the rest get full record
-                       sessions (~3–4x on large histories; worktree mode only)
+                        parallel.workers) pre-classify windows of commits
+                        (config parallel.window, default 32) in classify-only
+                        mode against a records snapshot; the main process
+                        replays each window in history order — classified
+                        NO_VULN commits are final, the rest get full record
+                        sessions (~3–4x on large histories; worktree mode
+                        only). K is the CEILING: on HTTP 429 the effective
+                        worker count halves (floor parallel.min_workers) and
+                        climbs back +1 per clean round (parallel.adaptive)
   --no-commit          don't git-commit this run
 --stop-on-fail       halt on the first failed commit (default: roll the baseline
                      back to the parent, requeue next run, continue)

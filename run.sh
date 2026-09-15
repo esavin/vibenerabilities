@@ -62,6 +62,16 @@ TREES="$WORK_DIR/.vibe-trees"
 # interrupt sweep's glob skips it).
 SNAP="$TREES/.classify-snap"
 CLASSIFY_PID=""
+# Adaptive rate limits: every agent process (classify worker, record
+# session, prefetch) appends one JSON line to $PAR_EVENTS whenever its LLM
+# request is retried on HTTP 429 (llm.py, env VULN_RATE_EVENTS); the classify
+# batch's AIMD controller halves the effective worker count on new events and
+# adds one back per round of clean sessions. The user configures only the
+# CEILING: --parallel K / parallel.workers (see par_slots below).
+PAR_EVENTS="$VERDICTS/ratelimit-events.jsonl"
+PAR_EFF_FILE="$VERDICTS/.parallel-eff"     # controller state: "<eff> <clean> <cursor>"
+PAR_INFLIGHT="$VERDICTS/.record-inflight"  # exists while the record phase's agent runs
+PAR_ADAPTIVE=true; PAR_MIN=1
 
 # make `python3 -m vuln_agent` importable regardless of the caller's cwd
 export PYTHONPATH="$PIPELINE_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -110,6 +120,11 @@ GIT_NAME="$(jstr '.git_author_name')";   GIT_NAME="${GIT_NAME:-vibenerabilities}
 GIT_EMAIL="$(jstr '.git_author_email')"; GIT_EMAIL="${GIT_EMAIL:-vibenerabilities@local}"
 
 mkdir -p "$VERDICTS" "$RUN_LOGS" "$RECORDS_ROOT/vulnerabilities" "$RECORDS_ROOT/design"
+
+# rate-limit telemetry sink for every agent process run.sh spawns (llm.py
+# appends one line per retried HTTP request; read by the --parallel AIMD
+# controller). Unset -> agents simply log nothing.
+export VULN_RATE_EVENTS="$PAR_EVENTS"
 
 # ---- workspace git ----
 gitw() { git -C "$WORK_DIR" "$@"; }
@@ -332,6 +347,7 @@ cleanup() {
       # request) - sweep so a restart starts clean. The glob skips
       # dot-entries (.classify-snap), so an in-flight snapshot copy that
       # no longer has readers is left for the next classify_start.
+      rm -f "$PAR_INFLIGHT"
       local d
       for d in "$TREES"/*; do [ -d "$d" ] || continue; rm -rf "$d" 2>/dev/null || true; done
       git -C "$SOURCE_DIR" worktree prune 2>/dev/null || true
@@ -458,12 +474,36 @@ classify_start() { # <shas...>: launch the K-slot classify batch in background
     # propagate termination to the classify_one workers (their own traps
     # kill the agent processes); BASHPID = this batch subshell, never $$
     trap 'trap - TERM INT; pkill -P "$BASHPID" 2>/dev/null; exit 143' TERM INT
-    local sha
+    local sha slots running pending=0
     for sha in "${shas[@]}"; do
-      while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL" ]; do wait -n || true; done
+      # spawn gate: the AIMD controller decides how many workers may be
+      # in flight; K is only the ceiling. A finished worker is credited to
+      # the clean streak (and may raise the count) only when no new 429
+      # events landed, so a saturated endpoint stays pinned at the floor.
+      while :; do
+        slots="$(par_slots check)"
+        running="$(jobs -rp | wc -l)"
+        [ "$running" -lt "$slots" ] && break
+        if [ "$running" -gt 0 ]; then
+          wait -n || true
+          par_slots finish >/dev/null; pending=$((pending - 1))
+        else
+          # zero slots with nothing running (the record session holds the
+          # whole budget): nothing to wait on, poll
+          sleep 2
+        fi
+      done
       classify_one "$sha" "$SNAP" &
+      pending=$((pending + 1))
     done
     wait || true
+    # the gate stops crediting once the last sha is spawned: account for the
+    # trailing worker finishes, else a clean window's tail never counts
+    # toward the additive increase
+    while [ "$pending" -gt 0 ]; do
+      par_slots finish >/dev/null
+      pending=$((pending - 1))
+    done
   ) &
   CLASSIFY_PID=$!
 }
@@ -485,6 +525,76 @@ classify_stop() { # kill the classify batch and its workers (limit/interrupt)
   # and any late verdict file is ignored: the next run re-classifies
   # commits it never replayed.
   CLASSIFY_PID=""
+}
+
+# ---- adaptive rate limits: AIMD concurrency control on top of --parallel K ----
+# --parallel K / parallel.workers is the CEILING - the only number the user
+# must guess. The EFFECTIVE number of classify workers adapts to HTTP 429
+# feedback from the endpoint: every agent process appends one line to
+# $PAR_EVENTS per retried request (llm.py), and the controller
+#   - halves the effective count on each batch of new 429 events (several
+#     new events at once halve repeatedly - a saturated endpoint 429s many
+#     workers within one spawn interval), floored at parallel.min_workers;
+#   - adds one back after <eff> consecutive cleanly-finished sessions,
+#     capped at K.
+# A running record session (the walk's single writer) reserves one slot via
+# $PAR_INFLIGHT, so the endpoint sees at most <eff> request streams. State
+# ("<eff> <clean> <cursor> <last429>") persists in $PAR_EFF_FILE across
+# windows; a fresh run re-initializes it. The additive increase additionally
+# requires $PAR_GRACE seconds without any 429: several workers failing
+# together land all their events before the first finish is credited, so
+# without a quiescence guard their trailing finishes would look clean and
+# immediately re-inflate the count. With parallel.adaptive=false the
+# controller is a passthrough to K (the fixed-K behaviour).
+PAR_GRACE=30   # seconds of 429-quiescence before the count may climb again
+par_log() { echo "parallel: $*" | tee -a "$WALK_LOG" >&2; }
+
+par_429_count() { # number of HTTP 429 events logged so far
+  local n=0
+  [ -f "$PAR_EVENTS" ] && { n="$(grep -c '"status": 429' "$PAR_EVENTS")" || n=0; }
+  echo "$n"
+}
+
+par_slots() { # <check|finish> -> print how many classify workers may run NOW
+  # "check": re-read the 429 events, apply any decrease, persist state.
+  # "finish": additionally credit ONE finished worker session to the clean
+  # streak - clean only when no new events arrived AND the last 429 is at
+  # least $PAR_GRACE seconds old. Spawns are never credited, so a saturated
+  # endpoint (every session 429s) pins the count at the floor instead of
+  # oscillating.
+  local mode="${1:-check}" cur eff clean cursor last429 new target i slots now
+  [ "$PAR_ADAPTIVE" = true ] || { echo "$PARALLEL"; return 0; }
+  now="$(date +%s)"
+  cur="$(par_429_count)"
+  eff=0; clean=0; cursor=-1; last429=0
+  [ -f "$PAR_EFF_FILE" ] && read -r eff clean cursor last429 < "$PAR_EFF_FILE" || true
+  case "$eff"     in ''|*[!0-9]*) eff="$PARALLEL";; esac
+  case "$clean"   in ''|*[!0-9]*) clean=0;; esac
+  case "$cursor"  in ''|*[!0-9]*) cursor="$cur";; esac
+  case "$last429" in ''|*[!0-9]*) last429=0;; esac
+  [ "$eff" -ge 1 ] && [ "$eff" -le "$PARALLEL" ] || eff="$PARALLEL"
+  new=$((cur - cursor)); [ "$new" -ge 0 ] || new=0   # truncated/rotated events file
+  if [ "$new" -gt 0 ]; then
+    target="$eff"
+    for ((i = 0; i < new && target > PAR_MIN; i++)); do
+      target=$(((target + 1) / 2))
+    done
+    [ "$target" -lt "$PAR_MIN" ] && target="$PAR_MIN"
+    par_log "HTTP 429 (x$new) -> classify workers $eff -> $target"
+    eff="$target"; clean=0; last429="$now"
+  elif [ "$mode" = finish ] && [ $((now - last429)) -ge "$PAR_GRACE" ]; then
+    clean=$((clean + 1))
+    if [ "$eff" -lt "$PARALLEL" ] && [ "$clean" -ge "$eff" ]; then
+      eff=$((eff + 1)); clean=0
+      par_log "clean round done -> classify workers up to $eff (ceiling $PARALLEL)"
+    fi
+  fi
+  printf '%d %d %d %d\n' "$eff" "$clean" "$cur" "$last429" \
+    > "$PAR_EFF_FILE" 2>/dev/null || true
+  slots="$eff"
+  [ -e "$PAR_INFLIGHT" ] && slots=$((slots - 1))   # the record session holds a slot
+  [ "$slots" -lt 0 ] && slots=0
+  echo "$slots"
 }
 
 # ---- run one commit ----
@@ -550,12 +660,18 @@ record_session() { # <sha> — full agent session against the LIVE records map
   # wrote nothing must never inherit a stale verdict file (it would be parsed
   # as this run's decision below)
   rm -f "$VERDICTS/$sha.txt" "$VERDICTS/$sha.json"
+  # while this agent session runs, the parallel classify batch reserves
+  # one concurrency slot for it (see par_slots) - the endpoint then never
+  # sees more than <eff> request streams. Sequential walks never read the
+  # marker, so it is only maintained in parallel mode.
+  [ "${PARALLEL:-0}" -ge 2 ] && touch "$PAR_INFLIGHT"
   rc=0
   if [ -n "$RUN_TIMEOUT" ] && [ "$RUN_TIMEOUT" != 0 ] && command -v timeout >/dev/null 2>&1; then
     timeout "${RUN_TIMEOUT}s" "${ag[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
   else
     "${ag[@]}" > "$RUN_LOGS/$sha.log" 2>&1 || rc=$?
   fi
+  rm -f "$PAR_INFLIGHT"
   free_tree "$path"
   CUR_TREE=""
 
@@ -777,7 +893,11 @@ Usage: run.sh [options]
                   hint commits) gets a full record session as the only
                   writer. Roughly 3-4x faster on large histories; needs
                   worktree mode. Watch live classification in walk.log.
-  --squash        Adaptive range-squash: runs of >= squash.min_series
+                  ADAPTIVE: K is the ceiling - when the endpoint answers
+                  HTTP 429, the effective worker count halves (floor
+                  parallel.min_workers) and climbs back +1 per round of
+                  clean sessions (config parallel.adaptive, default on).
+   --squash        Adaptive range-squash: runs of >= squash.min_series
                    consecutive guard-forced probably-irrelevant commits (e.g.
                    docs/tests-only commits with fix/security keywords in the
                    message) are classified in ONE session over the cumulative
@@ -840,6 +960,16 @@ fi
 if [ "$PARALLEL" -ge 2 ] 2>/dev/null; then
   { [ -z "$PAR_WINDOW" ] || ! [[ "$PAR_WINDOW" =~ ^[1-9][0-9]*$ ]]; } && PAR_WINDOW="${PAR_CFG_W:-32}"
   [[ "$PAR_WINDOW" =~ ^[1-9][0-9]*$ ]] || die "--parallel-window needs a positive integer"
+  # adaptive concurrency: K is the ceiling; on HTTP 429 feedback the
+  # effective worker count halves (floor parallel.min_workers) and climbs
+  # back +1 per round of clean sessions. adaptive=false pins K.
+  # NB: jq's `//` treats false as missing, so read the raw value and decide
+  # here - anything but an explicit "false" means adaptive (the default)
+  PAR_ADAPTIVE="$(jstr '.parallel.adaptive')"
+  [ "$PAR_ADAPTIVE" = "false" ] && PAR_ADAPTIVE=false || PAR_ADAPTIVE=true
+  PAR_MIN="$(jstr '.parallel.min_workers')"
+  [[ "$PAR_MIN" =~ ^[1-9][0-9]*$ ]] || PAR_MIN=1
+  [ "$PAR_MIN" -gt "$PARALLEL" ] && PAR_MIN="$PARALLEL"
   if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] \
      || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -lt 3 ]; }; then
     die "--parallel needs bash >= 4.3 (wait -n)"
@@ -1028,7 +1158,7 @@ fi
 
 {
   echo "=== vuln-walk started $(date -Iseconds) ==="
-  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} todo=$QUEUE_TOTAL total=$PROG_TOTAL worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N record_hints=$([ "$RECORD_HINTS" = 1 ] && echo "$PRIOR_REC_N" || echo 0)$( [ "$PARALLEL" -ge 2 ] && printf ' parallel=%d window=%d' "$PARALLEL" "$PAR_WINDOW" || true )$( [ "$SQUASH_ON" = 1 ] && echo ' squash=on' || true )"
+  echo "project=$PROJECT source=$SOURCE_REL branch=$BRANCH commits=${#SHAS[@]} todo=$QUEUE_TOTAL total=$PROG_TOTAL worktree=$USE_WORKTREE classify=$CLASSIFY_ONLY commit=$AUTO_COMMIT model=${OVERRIDE_MODEL:-$CFG_MODEL} preseeded=$PRESEEDED_N record_hints=$([ "$RECORD_HINTS" = 1 ] && echo "$PRIOR_REC_N" || echo 0)$( [ "$PARALLEL" -ge 2 ] && printf ' parallel=%d window=%d adaptive=%s' "$PARALLEL" "$PAR_WINDOW" "$([ "$PAR_ADAPTIVE" = true ] && echo on || echo off)" || true )$( [ "$SQUASH_ON" = 1 ] && echo ' squash=on' || true )"
 } | tee -a "$WALK_LOG"
 
 # ---- triage prefetch worker (config triage.enabled + triage.prefetch_ahead) ----
@@ -1069,7 +1199,11 @@ parallel_walk() {
   local sha wsha stop=0
   for sha in "${SHAS[@]}"; do [[ -v PROC["$sha"] ]] || WALK_TODO+=("$sha"); done
   [ "${#WALK_TODO[@]}" -gt 0 ] || { echo "No commits to process."; return 0; }
-  echo "parallel: workers=$PARALLEL window=$PAR_WINDOW commits=${#WALK_TODO[@]} (classify-only sessions run against a records snapshot; replay is sequential)" | tee -a "$WALK_LOG"
+  # fresh AIMD state for this run: start at the ceiling, count only 429 events
+  # logged from NOW on (the cursor starts at the current count)
+  rm -f "$PAR_INFLIGHT"   # stale marker from an interrupted run
+  printf '%d 0 %s 0\n' "$PARALLEL" "$(par_429_count)" > "$PAR_EFF_FILE"
+  echo "parallel: workers=$PARALLEL window=$PAR_WINDOW commits=${#WALK_TODO[@]} (classify-only sessions run against a records snapshot; replay is sequential)$( [ "$PAR_ADAPTIVE" = true ] && printf ' adaptive=on floor=%d ceiling=%d' "$PAR_MIN" "$PARALLEL" || echo ' adaptive=off' )" | tee -a "$WALK_LOG"
 
   local win=() fwin=() cwin=()
   mapfile -t win < <(slice_window 0)
