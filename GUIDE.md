@@ -52,8 +52,9 @@ Other `llm` knobs: `max_steps` (tool-call rounds per commit, default 24),
 `max_steps_initial` (step budget for the root/initial-snapshot commit; 48 is set by
 bootstrap's template and is a good value for projects born as one giant commit),
 `max_steps_cap` (default 48), `request_timeout_seconds` (per HTTP request, default 180),
-`retries` (default 5), `temperature` and `max_tokens` (omitted when null/0 — some strict
-gateways reject explicit values), `heartbeat_seconds` (default 60 — one
+`retries` (default 5), `temperature` (0 by default — sent explicitly for
+deterministic runs; null omits the field, some strict gateways reject explicit
+values) and `max_tokens` (omitted when 0), `heartbeat_seconds` (default 60 — one
 `[llm] waiting for <model>: Ns` line per interval while a single request is in flight;
 reasoning models regularly take minutes per round-trip, and without it the pipeline
 looks hung; 0 silences), `extra_body` (keys merged into the request payload — e.g.
@@ -451,7 +452,8 @@ fields in the template explain each):
 | `llm.request_timeout_seconds` | per HTTP request | `180` |
 | `llm.retries` | HTTP retries (1→16 min backoff, `Retry-After` honored) | `5` |
 | `llm.heartbeat_seconds` | `[… waiting]` line interval; 0 = silent | `60` |
-| `llm.temperature` / `max_tokens` | omitted when null/0 | `null` / `0` |
+| `llm.temperature` | `0` = deterministic (sent explicitly); `null` omits the field | `0` |
+| `llm.max_tokens` | omitted when 0 | `0` |
 | `llm.extra_body` | extra request payload keys (backend switches) | `{}` |
 | `llm.log_transcript` | write `verdicts/<sha>.transcript.jsonl` | `true` |
 | `limits.profile` | `default` (historical caps, compaction off) or `small` (~32k models) | `default` |

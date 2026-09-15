@@ -9,7 +9,7 @@ LLM_DEFAULTS = {
     "base_url": DEFAULT_BASE_URL,
     "api_key_env": "VULN_API_KEY",
     "model": "",
-    "temperature": None,
+    "temperature": 0,
     "max_tokens": 0,
     "max_steps": 24,
     "max_steps_initial": 0,

@@ -192,11 +192,13 @@ def load_triage_cache(cache_dir, sha, model=""):
     return state
 
 
-def save_triage_cache(cache_dir, sha, model, decision, reason, usage):
+def save_triage_cache(cache_dir, sha, model, decision, reason, usage,
+                      reply=""):
     if not cache_dir:
         return
     state = {"sha": sha, "model": model, "decision": decision,
              "via": "llm", "reason": reason,
+             "reply": (reply or "").strip()[:200],
              "usage": {"prompt_tokens": int((usage or {}).get("prompt_tokens")
                                             or 0),
                        "completion_tokens": int((usage or {})
@@ -372,8 +374,17 @@ def run_triage(client, worktree, sha, cfg, log,
     reply = str((response.get("message") or {}).get("content") or "")
     usage = response.get("usage") or {}
     decision = parse_decision(reply)
-    reason = "cascade pre-filter: CLEARLY_IRRELEVANT (diff seen in full)"
-    save_triage_cache(cache_dir, sha, model, decision, reason, usage)
+    # the cached reason must state what the model ACTUALLY answered - an
+    # unconditional "CLEARLY_IRRELEVANT" here once made a walk's whole
+    # analyze-cache look guard-forced and led to a false "triage never
+    # clears anything" conclusion
+    if decision == "skip":
+        reason = "cascade pre-filter: CLEARLY_IRRELEVANT (diff seen in full)"
+    else:
+        reason = ("cascade pre-filter: SECURITY_RELEVANT or doubted "
+                  "(full session required)")
+    save_triage_cache(cache_dir, sha, model, decision, reason, usage,
+                      reply=reply)
     if decision != "skip":
         return refuse("model answered SECURITY_RELEVANT/doubted")
 
