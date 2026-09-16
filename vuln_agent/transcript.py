@@ -4,8 +4,15 @@ One file per commit (``verdicts/<sha>.transcript.jsonl``, gitignored). Each line
 is one JSON event; replaying them in order reconstructs the exact message
 history the model saw:
 
-  {"type":"session", ...}    session header (model, budgets, prompt sizes)
-  {"type":"assistant", ...}  one model response: content, tool_calls,
+  {"type":"session", ...}    session header (model, budgets, prompt sizes,
+                             full system prompt + first user message texts,
+                             sampling parameters, tool names)
+  {"type":"assistant", ...}  one model response: content, reasoning (the
+                             model's chain of thought captured BEFORE the
+                             cleanup that keeps the echoed message
+                             API-clean - reasoning_content / reasoning key
+                             or an inline <think> block; null when the
+                             backend reported none), tool_calls,
                              finish_reason, per-step usage tokens
   {"type":"tool", ...}       one tool call: name, raw arguments, ok flag, and
                              the result exactly as it was fed back
@@ -82,6 +89,10 @@ def summarize(path):
                                               "root_commit", "max_steps")})
     print("model responses: %d; tool calls: %d"
           % (len(assistants), len(calls)))
+    with_reasoning = [e for e in assistants if (e.get("reasoning") or "").strip()]
+    if assistants:
+        print("reasoning captured: %d/%d response(s)"
+              % (len(with_reasoning), len(assistants)))
 
     print("\ncontext growth (per model response):")
     with_usage = [e for e in assistants if (e.get("usage") or {}).get("prompt_tokens")]

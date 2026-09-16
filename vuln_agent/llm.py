@@ -544,9 +544,24 @@ class ChatClient(object):
             message = choice["message"] or {}
         except (KeyError, IndexError, TypeError) as exc:
             raise FatalLLMError("unexpected response shape: %r" % exc)
-        # Keep only the standard fields: reasoning models (e.g. qwen3) add
-        # reasoning_content, which strict gateways reject on the next request.
-        content = ChatClient._rm_think(message.get("content"))
+        # Keep only the standard fields in the echoed message: reasoning
+        # models (e.g. qwen3) add reasoning_content, which strict gateways
+        # reject on the next request. The reasoning itself is preserved in
+        # the response's "reasoning" field (transcript-side only) so training
+        # data keeps the chain of thought: it is captured BEFORE any cleanup
+        # (separate reasoning_content / reasoning key, or an inline
+        # <think>...</think> block) and never re-enters the request history.
+        reasoning = message.get("reasoning_content")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            reasoning = message.get("reasoning")
+            if not isinstance(reasoning, str):
+                reasoning = None
+        content = message.get("content")
+        if isinstance(content, str) and "</think>" in content:
+            think, _, _ = content.rpartition("</think>")
+            if think.strip() and not reasoning:
+                reasoning = think
+        content = ChatClient._rm_think(content)
         clean = {"role": message.get("role") or "assistant", "content": content}
         # Flat internal shape: name/arguments at the top level. agent.py and
         # the transcript iterate tool_calls with call["name"]/["arguments"]/["id"].
@@ -603,6 +618,8 @@ class ChatClient(object):
         return {
             "message": clean,
             "content": content,
+            "reasoning": reasoning if isinstance(reasoning, str)
+            and reasoning.strip() else None,
             "tool_calls": tool_calls,
             "finish_reason": choice.get("finish_reason"),
             "usage": usage,

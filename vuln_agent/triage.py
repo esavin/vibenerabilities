@@ -398,6 +398,10 @@ def run_triage(client, worktree, sha, cfg, log,
             "compact_threshold_tokens": 0,
             "system_prompt_chars": len(TRIAGE_SYSTEM),
             "first_user_chars": len(user),
+            # full texts for transcript replay (training-data export)
+            "system_prompt": TRIAGE_SYSTEM,
+            "first_user": user,
+            "tools": [],
         })
         transcript.record({"type": "assistant", "step": 1, "content": reply,
                            "tool_calls": [],

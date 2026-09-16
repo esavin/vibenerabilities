@@ -400,8 +400,18 @@ def main(argv=None):
                 "repair_rounds": val_rounds,
                 "limits_profile": limits["profile"],
                 "compact_threshold_tokens": limits["compact_threshold_tokens"],
+                "temperature": llm["temperature"],
+                "max_tokens": llm["max_tokens"],
                 "system_prompt_chars": len(sys_prompt),
                 "first_user_chars": len(first_user),
+                # Full texts so the transcript alone reconstructs the exact
+                # model input (training-data replay): the first request is
+                # system + first_user verbatim, later requests follow the
+                # assistant/tool/user events.
+                "system_prompt": sys_prompt,
+                "first_user": first_user,
+                "tools": [t["function"]["name"]
+                          for t in tools.definitions()],
             }
             if extra:
                 record.update(extra)
