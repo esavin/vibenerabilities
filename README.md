@@ -138,34 +138,7 @@ into single commits with `git show`. A `NO_VULN` answer finalizes the whole
 run (member verdicts carry a `NO_VULN(squash a..b)` marker that
 `--reuse-verdicts` replays like any other); ANY other answer (vuln
 candidate, doubt, error) splits the range back into per-commit full record
-sessions — recall before speed. Sequential walk only (ignored with
-`--parallel`); preview with `--list --squash`.
-
-**Parallel classify-ahead** (`--parallel K`, worktree mode only): a NO_VULN
-verdict is a pure function of the commit, so K workers can *classify*
-commits ahead of the walk — each in classify-only mode against a per-window
-**snapshot** of the records map — while the main process remains the single
-writer and replays every window **in history order**: classified NO_VULN
-commits are finalized with no second session, and everything else (VULN
-candidates, classify failures, rename/delete and record-hint commits) gets a
-full record session against the live records map. The snapshot is slightly
-stale by design; that is safe because fix detection (Pass B) reads the diff,
-not the records — staleness can only cost a duplicate record later, never a
-false NO_VULN, and duplicates collapse in the record phase. Window size
-(default 32, `parallel.window`) bounds the staleness; K workers + 1 record
-session are in flight at most. Expected speedup at 12–15% VULN commits and
-K=6–8: ~3–4x (the ceiling is the serialized record tape).
-
-**Adaptive rate limits** (on by default): K is only the **ceiling** — every
-agent process logs its retried HTTP requests to
-`verdicts/ratelimit-events.jsonl` (llm.py), and an AIMD controller halves
-the effective number of concurrent sessions whenever the endpoint answers
-HTTP 429 (floor `parallel.min_workers`), then adds one back per round of
-clean sessions (cap K). A running record session reserves one slot, so the
-provider never sees more than the current budget. Set the ceiling
-generously and let the pipeline discover the provider's real limit;
-`parallel.adaptive: false` pins K. Watch `parallel: HTTP 429 (xN) ->
-classify workers A -> B` lines in `walk.log`.
+sessions — recall before speed. Preview with `--list --squash`.
 
 A failed commit (LLM outage, timeout, validation error) rolls the baseline back to its
 parent and is requeued automatically on the next run — nothing is ever silently skipped.
@@ -231,17 +204,7 @@ accepted. See `GUIDE.md` for the full semantics.
                        the message) into ONE session over the cumulative range
                        diff; NO_VULN finalizes the run, anything else splits
                        it back into per-commit sessions (config squash.*;
-                       sequential walk only, preview with --list --squash)
-  --parallel [K]       classify-ahead: K workers (default 4, config
-                        parallel.workers) pre-classify windows of commits
-                        (config parallel.window, default 32) in classify-only
-                        mode against a records snapshot; the main process
-                        replays each window in history order — classified
-                        NO_VULN commits are final, the rest get full record
-                        sessions (~3–4x on large histories; worktree mode
-                        only). K is the CEILING: on HTTP 429 the effective
-                        worker count halves (floor parallel.min_workers) and
-                        climbs back +1 per clean round (parallel.adaptive)
+                       preview with --list --squash)
   --no-commit          don't git-commit this run
 --stop-on-fail       halt on the first failed commit (default: roll the baseline
                      back to the parent, requeue next run, continue)

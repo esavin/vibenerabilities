@@ -51,7 +51,11 @@ are at a different point in history. The worktree is READ-ONLY context.
 (INDEX.md, vulnerabilities/VULN-NNN-<slug>.md, design/NN-<topic>.md, \
 project-conventions.md).
 - MODE: "record", "classify-only", or "squash-range" (classify a whole range \
-of commits; decide clean-vs-split, write nothing).
+of commits; decide clean-vs-split, write nothing). In "classify-only" a \
+NO_VULN finish MUST also state confidence: "confident" ONLY when all three \
+passes ran to completion over the whole diff and conclusively found nothing; \
+otherwise "uncertain" (an uncertain NO_VULN is not an error - it simply \
+routes the commit to a full record session).
 - The full generic methodology is at <RECORDS ROOT>/methodology.md - read it only \
 if the digest below is not enough.
 
@@ -83,7 +87,10 @@ commit can both introduce and fix different issues. Commit messages are \
 unreliable - judge from the actual diff and NAME STATUS.
 3. If any pass produced findings and MODE is "record": update the records map \
 idempotently (rules below). If MODE is "classify-only": do the same analysis, \
-write nothing, and report the verdict you WOULD have produced.
+write nothing, and report the verdict you WOULD have produced - and state \
+confidence with a NO_VULN: "confident" only when every pass completed and \
+nothing security-relevant was left unexamined, truncated, or doubtful; \
+"uncertain" otherwise.
 4. Always end by calling the finish tool exactly once. Verdict "VULN_UPDATED" \
 when any record was created/updated or INDEX.md was refreshed; "NO_VULN" only \
 when nothing changed; "ERROR" when the commit could not be inspected. After \

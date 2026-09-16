@@ -132,6 +132,14 @@ def verdict_line(verdict, records_root, records_root_rel):
                          for f in verdict.get("files") or [])
         return ("VERDICT: VULN_UPDATED " + files).rstrip()
     if verdict["verdict"] == "NO_VULN":
+        # triage-cascade skip: passed every recall guard already, final
+        if verdict.get("triage"):
+            return "VERDICT: NO_VULN(triage)"
+        # classify-only NO_VULN carries an explicit confidence marker so a
+        # verdict replayer can refuse "uncertain" skips (recall before speed)
+        confidence = str(verdict.get("confidence") or "").strip()
+        if confidence in ("confident", "uncertain"):
+            return "VERDICT: NO_VULN %s" % confidence
         return "VERDICT: NO_VULN"
     reason = " ".join(str(verdict.get("reason") or "unspecified").split())[:200]
     return "VERDICT: ERROR %s" % reason
@@ -224,7 +232,8 @@ def main(argv=None):
     sys_prompt = system_prompt()
 
     tools = ToolSet(worktree, records_root, classify_only=classify_only,
-                    limits=limits)
+                    limits=limits,
+                    require_confidence=(mode == "classify-only"))
     client = ChatClient(
         base_url=llm["base_url"],
         api_key=llm["api_key"],
@@ -358,8 +367,8 @@ def main(argv=None):
         # classify-only sessions get a hard step budget: a NO_VULN
         # classification is a pure function of the commit, so a session that
         # cannot conclude within classify_max_steps steps was wandering - its
-        # ERROR verdict safely falls back to a full record session (the
-        # parallel replay ignores it; a squash range splits). Root-commit
+        # ERROR verdict safely falls back to a full record session (a squash
+        # range splits on it). Root-commit
         # snapshot scans keep their deeper budget.
         classify_cap = int(limits.get("classify_max_steps") or 0)
         if classify_only and not root_commit and classify_cap > 0:
@@ -429,6 +438,10 @@ def main(argv=None):
                 limit_state_path=limit_state_path)
 
         if triage_skip is not None:
+            # mark the verdict as a cascade skip: it already passed every
+            # recall guard (keywords/renames/diff cap/doubt), so run.sh
+            # finalizes it like any other guarded NO_VULN
+            triage_skip["triage"] = True
             session_verdicts = [triage_skip]
             wrote_records = False
             verdict = triage_skip
@@ -520,6 +533,13 @@ def main(argv=None):
             "usage": usage,
             "sessions": len(session_verdicts),
         }
+        if session_verdicts:
+            # carry the deciding session's classify confidence / triage-skip
+            # marker into the commit verdict - verdict_line (and run.sh's
+            # replay gate behind it) key off them
+            for _key in ("confidence", "triage"):
+                if _key in session_verdicts[-1]:
+                    verdict[_key] = session_verdicts[-1][_key]
         if failed:
             verdict["verdict"] = "ERROR"
             verdict["files"] = []

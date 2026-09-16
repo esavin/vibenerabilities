@@ -38,11 +38,11 @@ LIMIT_DEFAULTS = {
     "git_output_chars": 150_000,
     "read_file_chars": 24_000,
     "list_dir_chars": 40_000,
-    # classify-only sessions (--classify-only / --squash-range workers):
+    # classify-only sessions (--dry-run / --squash-range):
     # hard step budget. A NO_VULN classification is a pure function of the
     # commit - a session that cannot conclude within this many steps was
     # wandering, and its ERROR verdict safely falls back to a full record
-    # session (parallel: replay ignores it; squash: the range splits).
+    # session (a squash range splits on it).
     # 0 disables (llm.max_steps applies). Not applied to root-commit scans.
     "classify_max_steps": 8,
     # preload FULL bodies of the most-touched small changed files into the

@@ -223,52 +223,7 @@ silently lost their INDEX.md row; all of it is mechanically checkable:
   function of the commit (diff + message + model) — it never depends on the records
   map or earlier outcomes. Delete `verdicts/triage/` to reset the cache (also after
   changing `triage.diff_chars` or the model).
-- **Parallel classify-ahead** (`--parallel [K]`, worktree mode only): a `NO_VULN`
-  verdict is a pure function of the commit (the `--reuse-verdicts` contract), so it
-  can be computed *ahead* of the ordered records tape. K workers (default 4, or
-  config `parallel.workers`) each run classify-only sessions over a window of
-  `parallel.window` commits (default 32; `--parallel-window W` overrides) against a
-  per-window **snapshot** of the records map; the main process — the only writer —
-  then replays the window in history order: classified NO_VULN commits are finalized
-  with no second session, everything else gets a full record session against the live
-  records map. The next window's classification overlaps the current window's replay
-  (K classify workers + 1 record session in flight at most).
-  Safety: the records snapshot is stale by up to the window, which is fine because
-  fix detection (Pass B) reads the *diff*, not the records — staleness can only cost
-  a duplicate record later (collapsed by the record phase's read-before-write
-  matcher), never a false NO_VULN. Rename/delete commits, prior-run hint commits
-  (`--record-hints`), preseeded/regex skips and root commits skip classification
-  entirely and go straight to the record phase. A classify ERROR or crash falls back
-  to a record session, so a worker failure never loses a commit.
-  Semantics of the other flags are unchanged: `--limit` bounds replayed commits,
-  `--stop-on-fail` halts on a record-session failure, `--dry-run` classifies with no
-  side effects at all. Interrupt-safe: killed workers' worktrees are swept on exit,
-  the baseline only ever advances in the replay, and un-replayed classification is
-  simply redone next run. Watch live classification with `tail -f walk.log`
-  (`CLASSIFY` lines). Expected speedup at 12–15% VULN commits with K=6–8: ~3–4x —
-  the ceiling is the serialized VULN tape (0.15 × N × ~250s), so raise K only while
-  classify lines still dominate `walk.log`.
-  **Adaptive rate limits** (`parallel.adaptive`, default on): K is only the ceiling
-  you configure — the pipeline discovers the provider's real budget on its own.
-  Every agent process (classify worker, record session, prefetch worker) appends
-  one JSON line to `verdicts/ratelimit-events.jsonl` for each retried HTTP request;
-  the classify batch's AIMD controller counts new HTTP 429 events before each
-  spawn and halves the effective worker count on each event batch (repeatedly when
-  several arrive at once — a saturated endpoint 429s many workers within one spawn
-  interval), floored at `parallel.min_workers` (default 1). After `eff` cleanly
-  finished sessions the count climbs back by one, capped at K — spawns are
-  never credited, so an endpoint that 429s every session stays pinned at the
-  floor instead of oscillating. A running record
-  session reserves one slot (marker `verdicts/.record-inflight`), so at most
-  `eff` request streams hit the endpoint. In-flight workers are never killed —
-  their own
-  client retries (60s+ backoff, Retry-After honoured) ride out the burst while the
-  NEXT spawn is gated. Adaptation lines land in `walk.log`
-  (`parallel: HTTP 429 (xN) -> classify workers A -> B` / `clean round done ->
-  ...`); the effective count persists across windows within a run and resets to
-  the ceiling on the next run. `parallel.adaptive: false` pins K at the ceiling.
-- **Range-squash for guard-forced noise** (`--squash`, or config `squash.enabled`;
-  sequential walk only): a NO_VULN on a "probably irrelevant" commit is the common
+- **Range-squash for guard-forced noise** (`--squash`, or config `squash.enabled`):
   outcome of a full multi-step session the triage cascade could not skip — the classic
   is a docs/tests-only commit whose *message* contains a fix/security keyword (the
   keyword guard refuses any cheap path). Runs of `squash.min_series` (default 3) or
@@ -290,9 +245,7 @@ silently lost their INDEX.md row; all of it is mechanically checkable:
   `NO_VULN(squash <a>..<b>)` marker that `--reuse-verdicts` replays like any other
   NO_VULN; transcripts/verdict JSONs note the `squash_range`. Preview the plan with
   `run.sh --list --squash` (SQUASH decisions, no agent calls); watch `SQUASH n
-  commits` / `CLEAN (squashed a..b)` / `-> split (...)` lines in `walk.log`. With
-  `--parallel` the flag is ignored with a warning — classify-ahead already cheapens
-  guard-forced commits.
+  commits` / `CLEAN (squashed a..b)` / `-> split (...)` lines in `walk.log`.
 - **Provider context-limit persistence** (automatic): the first session that hits a
   context-overflow HTTP 400 persists the provider-reported window to
   `verdicts/provider-limit.json`; every later session seeds its compaction threshold

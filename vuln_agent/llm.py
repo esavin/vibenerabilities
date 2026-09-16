@@ -22,11 +22,11 @@ import urllib.request
 
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 
-# Shared rate-limit telemetry: when the env names a file (run.sh exports it
-# for every agent process it spawns), each retried HTTP-level request appends
-# one JSON line {"ts","status","retry","delay","model"} to it. The --parallel
-# AIMD controller in run.sh tails this file and shrinks concurrency on
-# HTTP 429 bursts. Unset (manual runs) -> no telemetry, no behaviour change.
+# Shared rate-limit telemetry: when the env names a file, each retried
+# HTTP-level request appends one JSON line
+# {"ts","status","retry","delay","model"} to it, so an external controller
+# can react to HTTP 429 bursts. Unset (manual runs) -> no telemetry, no
+# behaviour change.
 RATE_EVENTS_ENV = "VULN_RATE_EVENTS"
 # Provider outages (503 "no available server") span minutes: wait 1, 2, 4, 8,
 # 16 minutes between HTTP-level retries instead of burning them within seconds.

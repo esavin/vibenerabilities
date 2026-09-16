@@ -273,8 +273,8 @@ def save_provider_limit(path, limit, model="", base_url=""):
              "base_url": base_url, "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        # pid-suffixed tmp: several classify workers may discover the same
-        # provider window concurrently (--parallel) and must not clobber
+        # pid-suffixed tmp: concurrent sessions may discover the same
+        # provider window at once and must not clobber
         # each other's in-flight tmp file before the atomic replace
         tmp = "%s.%d.tmp" % (path, os.getpid())
         with open(tmp, "w", encoding="utf-8") as fh:

@@ -124,10 +124,16 @@ def _path_candidates(line):
 
 
 class ToolSet(object):
-    def __init__(self, worktree, records_root, classify_only=False, limits=None):
+    def __init__(self, worktree, records_root, classify_only=False, limits=None,
+                 require_confidence=False):
         self.worktree = os.path.realpath(str(worktree))
         self.records_root = os.path.realpath(str(records_root))
         self.classify_only = classify_only
+        # classify-only NO_VULN contract: the finish must state an explicit
+        # confidence; anything unstated counts as "uncertain" so a verdict
+        # replayer can route the commit to a full record session (recall
+        # before speed). Off for record and squash-range sessions.
+        self.require_confidence = require_confidence
         self.read_roots = [self.worktree, self.records_root]
         # Output caps (config `limits` section; module constants are the
         # defaults, so a missing section reproduces the historical sizes).
@@ -342,7 +348,10 @@ class ToolSet(object):
                         "End this step. The ONLY way to finish. verdict: VULN_UPDATED if you "
                         "created/modified records (files = their records-root-relative paths), "
                         "NO_VULN if nothing warranted a change, ERROR if you could not "
-                        "inspect the commit."
+                        "inspect the commit. In classify-only mode a NO_VULN finish MUST "
+                        "also set confidence: 'confident' only when all three detection "
+                        "passes ran to completion over the whole diff and conclusively "
+                        "found nothing; 'uncertain' otherwise."
                     ),
                     "parameters": {
                         "type": "object",
@@ -353,6 +362,16 @@ class ToolSet(object):
                             "files": {"type": "array",
                                       "items": {"type": "string"}},
                             "reason": {"type": "string"},
+                            "confidence": {
+                                "type": "string",
+                                "enum": ["confident", "uncertain"],
+                                "description": (
+                                    "classify-only NO_VULN: 'confident' only "
+                                    "when every pass completed and nothing "
+                                    "security-relevant was left unexamined or "
+                                    "truncated; 'uncertain' otherwise (routes "
+                                    "the commit to a full record session)"),
+                            },
                         },
                         "required": ["verdict"],
                     },
@@ -977,9 +996,18 @@ class ToolSet(object):
         reason = args.get("reason") or ""
         if not isinstance(reason, str):
             reason = str(reason)
-        self.finish_result = {
+        confidence = args.get("confidence")
+        if confidence not in ("confident", "uncertain"):
+            confidence = ""
+        result = {
             "verdict": verdict,
             "files": files,
             "reason": reason,
         }
+        # classify-only contract: a NO_VULN that does not explicitly claim
+        # confidence is treated as "uncertain" - a verdict replayer then
+        # falls back to a full record session instead of finalizing the skip
+        if verdict == "NO_VULN" and self.require_confidence:
+            result["confidence"] = confidence or "uncertain"
+        self.finish_result = result
         return {"ok": True, "finished": True}
