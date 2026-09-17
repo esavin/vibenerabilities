@@ -35,6 +35,7 @@ from .agent import PROVIDER_LIMIT_FILE
 from .config import (ConfigError, load_config, resolve_llm, resolve_limits,
                      resolve_triage)
 from .llm import ChatClient
+from .transcript import Transcript
 from .triage import load_triage_cache, run_triage, triage_cache_path
 
 
@@ -126,13 +127,22 @@ def main(argv=None):
             continue
         idle = 0
         for sha in window:
+            transcript = None
+            if llm["log_transcript"]:
+                try:
+                    transcript = Transcript(os.path.join(
+                        args.verdicts_dir, sha + ".transcript.jsonl"))
+                except OSError:
+                    transcript = None  # unwritable verdicts dir: skip logging
             run_triage(client, args.source, sha, triage, log,
                        root_commit=None, old_paths=None, changed=0,
-                       limits=limits, transcript=None,
+                       limits=limits, transcript=transcript,
                        model=llm["model"], base_url=llm["base_url"],
                        cache_dir=cache_dir,
                        limit_state_path=os.path.join(
                            args.verdicts_dir, PROVIDER_LIMIT_FILE))
+            if transcript is not None:
+                transcript.close()
             handled.add(sha)
         # the walk advances meanwhile: re-derive the window promptly
         time.sleep(min(args.interval, 2))

@@ -386,6 +386,33 @@ def run_triage(client, worktree, sha, cfg, log,
     save_triage_cache(cache_dir, sha, model, decision, reason, usage,
                       reply=reply)
     if decision != "skip":
+        # transcript the refused triage too (prefetch worker or inline): a
+        # SECURITY_RELEVANT/doubted one-shot is exactly the hard-case class
+        # a dataset wants, and the full session that follows lands in the
+        # same transcript file
+        if transcript is not None:
+            transcript.record({
+                "type": "session", "sha": sha, "model": model,
+                "base_url": base_url, "mode": "triage", "root_commit": False,
+                "max_steps": 1, "repair_rounds": 0,
+                "limits_profile": lim.get("profile"),
+                "compact_threshold_tokens": 0,
+                "system_prompt_chars": len(TRIAGE_SYSTEM),
+                "first_user_chars": len(user),
+                # full texts for transcript replay (training-data export)
+                "system_prompt": TRIAGE_SYSTEM,
+                "first_user": user,
+                "tools": [],
+            })
+            transcript.record({"type": "assistant", "step": 1,
+                               "content": reply,
+                               "reasoning": response.get("reasoning"),
+                               "tool_calls": [],
+                               "finish_reason": response.get("finish_reason"),
+                               "usage": usage})
+            transcript.record({"type": "triage", "decision": "analyze",
+                               "via": "llm", "reason": reason,
+                               "model": model, "sha": sha})
         return refuse("model answered SECURITY_RELEVANT/doubted")
 
     log("triage: skip (%s)" % reason)

@@ -388,7 +388,11 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                        compact_keep))
                 record({"type": "compact", "step": step,
                         "prompt_tokens": last_prompt_tokens,
-                        "results_shrunk": len(shrunk)})
+                        "results_shrunk": len(shrunk),
+                        # full post-compaction history: lets a transcript
+                        # replay stay byte-exact (dataset export swaps its
+                        # prefix for this instead of flagging divergence)
+                        "messages_after": messages})
             else:
                 compact_stalled = True  # everything already small; retry later
         # pre-flight overflow guard: the compaction trigger above fires on
@@ -419,7 +423,8 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                     record({"type": "preflight_overflow", "step": step,
                             "pass": guard_pass, "chars_freed": freed,
                             "projected_tokens": projected,
-                            "provider_limit": provider_limit})
+                            "provider_limit": provider_limit,
+                            "messages_after": messages})
                     projected = _tail_estimate(messages, last_prompt_tokens)
                 # freed == 0: escalate to the next pass (same ladder as the
                 # 400 recovery - single-group sessions only yield at pass 2+)
@@ -446,7 +451,8 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                         record({"type": "overflow", "step": step,
                                 "pass": overflow_pass,
                                 "chars_freed": freed,
-                                "provider_limit": exc.limit})
+                                "provider_limit": exc.limit,
+                                "messages_after": messages})
                         break
                 else:
                     raise

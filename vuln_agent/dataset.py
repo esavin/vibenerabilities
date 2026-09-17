@@ -34,6 +34,7 @@ their session event carries the full prompt texts.
 """
 
 import argparse
+import copy
 import glob
 import json
 import os
@@ -85,6 +86,24 @@ def _collect(paths):
 class _Session(object):
     """Replay state for one agent session (one transcript may hold several:
     triage + full session, or multiple hygiene batches)."""
+
+    stop_at_compaction = False   # per-export flag (set from export_file)
+
+    def on_diverge(self, event):
+        """Compaction/overflow shrank the live history.
+
+        Transcripts from agents that snapshot the post-shrink history
+        (``messages_after``) replay byte-exact: swap the prefix for the
+        snapshot. Older transcripts only recorded the shrink fact - the
+        rebuilt prefix is then UNCOMPACTED and such samples are flagged
+        ``diverged`` (or dropped with --stop-at-compaction)."""
+        if self.stop_at_compaction:
+            self.replayable = False
+            return
+        if event.get("messages_after"):
+            self.prefix = copy.deepcopy(event["messages_after"])
+        else:
+            self.diverged = True
 
     def __init__(self, header):
         self.header = header
@@ -167,6 +186,7 @@ class _Session(object):
 
 def export_file(path, args):
     """One transcript file -> list of samples (session-filtered)."""
+    _Session.stop_at_compaction = bool(args.stop_at_compaction)
     sessions = []
     current = None
     for event in transcript_mod.load(path):
@@ -181,10 +201,7 @@ def export_file(path, args):
         elif kind == "user" and current is not None:
             current.on_user(event)
         elif kind in DIVERGE_EVENTS and current is not None:
-            if args.stop_at_compaction:
-                current.replayable = False
-            else:
-                current.diverged = True
+            current.on_diverge(event)
         elif kind == "end" and current is not None:
             current.on_end(event)
     samples = []
