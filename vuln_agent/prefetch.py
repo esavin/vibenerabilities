@@ -132,8 +132,13 @@ def main(argv=None):
         if not window:
             idle += args.interval
             if idle >= args.max_idle:
-                log("no work for %ds (baseline stuck at %s?) - exiting"
-                    % (idle, baseline[:10] or "none"))
+                log("everything visible up to source HEAD is already "
+                    "triaged (%d commit(s) in plan) - waited %ds for new "
+                    "upstream commits, none appeared - exiting (rerun after "
+                    "`git pull` in the source repo; a stuck baseline is NOT "
+                    "the cause: the walk consuming the cache does not add "
+                    "work here)"
+                    % (len(plan), idle))
                 return 0
             time.sleep(args.interval)
             continue
