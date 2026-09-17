@@ -431,21 +431,31 @@ def main(argv=None):
                 and not (plan and (plan["prepass_edited"]
                                    or plan["stale_by_record"]))):
             triage_client = client
-            if triage["model"] != llm["model"]:
+            if (triage["model"] != llm["model"]
+                    or triage["base_url"] != llm["base_url"]
+                    or triage["api_key"] != llm["api_key"]):
                 triage_client = ChatClient(
-                    base_url=llm["base_url"], api_key=llm["api_key"],
+                    base_url=triage["base_url"], api_key=triage["api_key"],
                     model=triage["model"], timeout=llm["timeout"],
                     retries=llm["retries"], temperature=llm["temperature"],
                     max_tokens=llm["max_tokens"],
                     extra_body=llm["extra_body"],
                     heartbeat_seconds=llm["heartbeat_seconds"])
+            # a triage model on a DIFFERENT endpoint must not learn/overwrite
+            # the main model's provider window (the shared file would ping-pong
+            # between the two and force re-discovery 400s)
+            if triage["base_url"] == llm["base_url"]:
+                triage_limit_path = limit_state_path
+            else:
+                triage_limit_path = os.path.join(
+                    args.verdicts_dir, "provider-limit-triage.json")
             triage_skip = run_triage(
                 triage_client, worktree, args.sha, triage, log,
                 root_commit=root_commit, old_paths=old_paths,
                 changed=changed, limits=limits, transcript=transcript,
-                model=triage["model"], base_url=llm["base_url"],
+                model=triage["model"], base_url=triage["base_url"],
                 cache_dir=os.path.join(args.verdicts_dir, "triage"),
-                limit_state_path=limit_state_path)
+                limit_state_path=triage_limit_path)
 
         if triage_skip is not None:
             # mark the verdict as a cascade skip: it already passed every

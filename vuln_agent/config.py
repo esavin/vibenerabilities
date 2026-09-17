@@ -121,6 +121,12 @@ TRIAGE_DEFAULTS = {
     "enabled": False,
     # "" = llm.model; point at a cheaper/faster model if the endpoint has one
     "model": "",
+    # "" = llm.base_url - set ONLY when the triage model lives on a DIFFERENT
+    # endpoint than the main one (e.g. a free local/small provider doing the
+    # first classification while the main llm.* is the big paid model)
+    "base_url": "",
+    # "" = llm.api_key_env's key; the env var named here wins when set
+    "api_key_env": "",
     # 0 = AUTO: derive from the persisted provider window (verdicts/
     # provider-limit.json, ~3 chars per input token minus reserve) with a
     # conservative fallback until a window is learned; an explicit value
@@ -376,7 +382,13 @@ def resolve_triage(config, llm):
     resolved = {
         "enabled": enabled,
         "model": str(merged["model"] or llm["model"]),
+        # triage may live on a different endpoint: "" inherits from llm.*
+        "base_url": str(merged["base_url"] or llm["base_url"]).rstrip("/"),
+        "api_key": llm["api_key"],
         "irrelevant_globs": [str(g) for g in globs],
     }
+    if merged["api_key_env"]:
+        resolved["api_key"] = (os.environ.get(merged["api_key_env"], "")
+                               or llm["api_key"])
     resolved.update(numbers)
     return resolved

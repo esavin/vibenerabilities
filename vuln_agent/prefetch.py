@@ -91,13 +91,24 @@ def main(argv=None):
         log("triage disabled - nothing to prefetch")
         return 0
 
+    # the prefetch worker serves ONLY triage: build the client from the
+    # triage settings (model/base_url/api_key may point at a different,
+    # cheaper endpoint than the main llm.*)
     client = ChatClient(
-        base_url=llm["base_url"], api_key=llm["api_key"],
-        model=llm["model"], timeout=llm["timeout"], retries=llm["retries"],
+        base_url=triage["base_url"], api_key=triage["api_key"],
+        model=triage["model"], timeout=llm["timeout"], retries=llm["retries"],
         temperature=llm["temperature"], max_tokens=llm["max_tokens"],
         extra_body=llm["extra_body"],
         heartbeat_seconds=llm["heartbeat_seconds"])
     cache_dir = os.path.join(args.verdicts_dir, "triage")
+    if triage["base_url"] == llm["base_url"]:
+        triage_limit_path = os.path.join(args.verdicts_dir,
+                                         PROVIDER_LIMIT_FILE)
+    else:
+        # a different endpoint must not clobber the main model's discovered
+        # provider window (and vice versa)
+        triage_limit_path = os.path.join(args.verdicts_dir,
+                                         "provider-limit-triage.json")
 
     skip_merges = config.get("skip_merges") is True
     scope = str(config.get("scope") or "").strip()
@@ -114,7 +125,8 @@ def main(argv=None):
             log("plan exhausted (baseline at HEAD) - exiting")
             return 0
         for sha in plan[:args.ahead * 3]:
-            if load_triage_cache(cache_dir, sha, model=llm["model"]) is not None:
+            if load_triage_cache(cache_dir, sha,
+                                model=triage["model"]) is not None:
                 handled.add(sha)  # cached by an earlier poll/process
         window = [sha for sha in plan if sha not in handled][:args.ahead]
         if not window:
@@ -137,10 +149,10 @@ def main(argv=None):
             run_triage(client, args.source, sha, triage, log,
                        root_commit=None, old_paths=None, changed=0,
                        limits=limits, transcript=transcript,
-                       model=llm["model"], base_url=llm["base_url"],
+                       model=triage["model"],
+                       base_url=triage["base_url"],
                        cache_dir=cache_dir,
-                       limit_state_path=os.path.join(
-                           args.verdicts_dir, PROVIDER_LIMIT_FILE))
+                       limit_state_path=triage_limit_path)
             if transcript is not None:
                 transcript.close()
             handled.add(sha)
