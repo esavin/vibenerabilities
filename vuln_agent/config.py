@@ -381,10 +381,13 @@ def resolve_triage(config, llm):
         raise ConfigError("triage.irrelevant_globs must be a list of globs")
     resolved = {
         "enabled": enabled,
-        "model": str(merged["model"] or llm["model"]),
+        # llm may be a partial stub (squash.py passes {"model": ""} for
+        # guard-only planning) - .get() keeps that working
+        "model": str(merged["model"] or llm.get("model") or ""),
         # triage may live on a different endpoint: "" inherits from llm.*
-        "base_url": str(merged["base_url"] or llm["base_url"]).rstrip("/"),
-        "api_key": llm["api_key"],
+        "base_url": str(merged["base_url"] or llm.get("base_url")
+                        or "").rstrip("/"),
+        "api_key": llm.get("api_key", ""),
         "irrelevant_globs": [str(g) for g in globs],
     }
     if merged["api_key_env"]:
