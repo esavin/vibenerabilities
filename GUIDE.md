@@ -40,6 +40,7 @@ The agent speaks the OpenAI-compatible chat-completions API. Configure in
 | Setting | config.json | env override | default |
 | --- | --- | --- | --- |
 | model | `llm.model` | `VULN_MODEL` (or `--model`) | — (required) |
+| fallback model | `llm.fallback_model` | `VULN_FALLBACK_MODEL` | `""` (off) |
 | endpoint | `llm.base_url` | `VULN_BASE_URL` | `https://api.openai.com/v1` |
 | API key | `llm.api_key_env` names the env var | `VULN_API_KEY` (fallback `OPENAI_API_KEY`) | — |
 
@@ -472,8 +473,26 @@ fields in the template explain each):
   - identical tool calls repeated, plain-text answers that never call `finish`, or
     garbage tool arguments at a small token count → the model itself is too weak for
     tool loops; switch model. The pipeline already compensates for the most common
-    weak-model traits (duplicate-call guard, bounded nudges, deadline pressure, finish
-    grace + verdict synthesis — see "Model / endpoint configuration").
+    weak-model traits (duplicate-call guard, per-path read/edit loop guards, bounded
+    nudges, deadline pressure, finish grace + verdict synthesis — see
+    "Model / endpoint configuration").
+  Built-in safety nets for exactly this failure (all measured on real walks):
+  - **loop guards** — a third identical tool call is always refused (one re-read of
+    compacted-away content is legitimate, more is a spiral); one file may be
+    `read_file`d at most 8× and one record `edit_record`ed at most 5× per session
+    (paging a large file needs ≤ 6 reads; beyond that the model is re-reading ranges
+    it already saw).
+  - **verdict-salvage round** — a session that exhausts its budget WITHOUT records
+    gets one finish-only round: a salvaged `NO_VULN` is written as
+    `VERDICT: NO_VULN uncertain (salvaged…)` so a later `--reuse-verdicts` rerun
+    re-analyzes it instead of replaying it for free; a claimed `VULN_UPDATED` with
+    nothing written stays an honest ERROR (requeue).
+  - **fallback-model retry** — set `llm.fallback_model` (or `VULN_FALLBACK_MODEL`)
+    to a different model on the same endpoint: one behavioral ERROR (max_steps /
+    empty / text-only responses) in a record session is retried once on the fallback
+    — model variants fail differently (a no-reasoning build loops on re-reads, a
+    reasoning build hides output in reasoning), so the retry recovers commits the
+    primary model fails on *repeatedly*.
   Note: a genuinely *exceeded* context window surfaces differently — as a context-limit
   HTTP 400 (auto-recovered, see next item), not as max_steps.
 - **Context-limit HTTP 400 in logs** — expected on small windows and handled in place:

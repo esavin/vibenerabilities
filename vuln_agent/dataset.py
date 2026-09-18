@@ -44,8 +44,11 @@ from . import transcript as transcript_mod
 
 # injected user-message sources that are pipeline machinery, not analysis
 # input; a sample whose prefix ENDS with one of these teaches recovery from
-# pipeline pressure - tag it so the consumer can filter
-SYNTHETIC_SOURCES = ("nudge:", "deadline", "grace", "extension")
+# pipeline pressure - tag it so the consumer can filter (the no-records
+# salvage round "grace-nowrite" is machinery too: its forced best-effort
+# finish is not an organic analysis decision)
+SYNTHETIC_SOURCES = ("nudge:", "deadline", "grace", "grace-nowrite",
+                     "extension")
 
 DIVERGE_EVENTS = ("compact", "overflow", "preflight_overflow")
 

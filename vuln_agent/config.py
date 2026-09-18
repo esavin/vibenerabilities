@@ -9,6 +9,12 @@ LLM_DEFAULTS = {
     "base_url": DEFAULT_BASE_URL,
     "api_key_env": "VULN_API_KEY",
     "model": "",
+    # ONE retry of a behaviorally failed record session (max_steps spiral /
+    # empty or text-only responses) on this OTHER model of the SAME
+    # endpoint - model variants fail differently, so the fallback recovers
+    # commits the primary model fails on repeatedly. "" disables.
+    # Environment override: VULN_FALLBACK_MODEL.
+    "fallback_model": "",
     "temperature": 0,
     "max_tokens": 0,
     "max_steps": 24,
@@ -127,6 +133,10 @@ TRIAGE_DEFAULTS = {
     "base_url": "",
     # "" = llm.api_key_env's key; the env var named here wins when set
     "api_key_env": "",
+    # null/absent = inherit llm.extra_body; {} = NO extras at all (a strict
+    # triage endpoint that rejects foreign params like DeepSeek's
+    # {"thinking": ...}); a non-empty object overrides entirely
+    "extra_body": None,
     # 0 = AUTO: derive from the persisted provider window (verdicts/
     # provider-limit.json, ~3 chars per input token minus reserve) with a
     # conservative fallback until a window is learned; an explicit value
@@ -186,7 +196,7 @@ def load_config(path):
     return data
 
 
-def resolve_llm(config, cli_model=None, cli_max_steps=None):
+def resolve_llm(config, cli_model=None, cli_max_steps=None, cli_fallback=None):
     """Merge llm settings from config.json, environment, and CLI overrides."""
     section = config.get("llm")
     if not isinstance(section, dict):
@@ -201,6 +211,9 @@ def resolve_llm(config, cli_model=None, cli_max_steps=None):
             "no model configured - set llm.model in config.json, export VULN_MODEL,"
             " or pass --model"
         )
+    fallback_model = (cli_fallback
+                      or os.environ.get("VULN_FALLBACK_MODEL")
+                      or merged.get("fallback_model") or "")
 
     api_key = os.environ.get("VULN_API_KEY", "")
     if not api_key and merged["api_key_env"]:
@@ -240,6 +253,7 @@ def resolve_llm(config, cli_model=None, cli_max_steps=None):
     return {
         "base_url": base_url.rstrip("/"),
         "model": model,
+        "fallback_model": str(fallback_model).strip(),
         "api_key": api_key,
         "temperature": temperature,
         "max_tokens": max_tokens,
@@ -390,6 +404,17 @@ def resolve_triage(config, llm):
         "api_key": llm.get("api_key", ""),
         "irrelevant_globs": [str(g) for g in globs],
     }
+    # extra_body: null/absent inherits llm.extra_body; {} disables extras;
+    # a non-empty object overrides. NOTE: resolve_triage's merge drops None
+    # and "" section values, so {} (explicit "no extras") survives while an
+    # absent key falls back to the None default above.
+    extra_body = merged.get("extra_body")
+    if extra_body is None:
+        extra_body = llm.get("extra_body") or {}
+    if not isinstance(extra_body, dict):
+        raise ConfigError("triage.extra_body must be a JSON object "
+                          "(null = inherit llm.extra_body, {} = none)")
+    resolved["extra_body"] = extra_body
     if merged["api_key_env"]:
         resolved["api_key"] = (os.environ.get(merged["api_key_env"], "")
                                or llm["api_key"])

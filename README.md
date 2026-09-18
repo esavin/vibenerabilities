@@ -209,6 +209,9 @@ accepted. See `GUIDE.md` for the full semantics.
 --stop-on-fail       halt on the first failed commit (default: roll the baseline
                      back to the parent, requeue next run, continue)
 --model M            override the model (or export VULN_MODEL)
+--fallback-model M   one retry of behaviorally failed record sessions on this
+                      model of the same endpoint (or export VULN_FALLBACK_MODEL;
+                      config llm.fallback_model)
 ```
 
 See `GUIDE.md` for porting to a new project/language, performance tips, reruns, and

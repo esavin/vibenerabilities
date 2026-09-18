@@ -74,6 +74,19 @@ WRITE_EXTRA_STEPS = 6
 WRITE_EXTENSIONS = 2
 RECONSIDER_EXTRA_STEPS = 8  # budget for the one-shot prior-records reconsideration
 DEADLINE_WINDOW = 5  # last N steps of the budget get deadline pressure
+# anti-loop guards (measured on qwen3.6-unlim-noreason walks): a canonical
+# (name, args) call may execute at most this many times per session - the
+# second execution is the legitimate "result was compacted away, need it
+# again" re-read; a THIRD identical call is a spiral and is always refused
+MAX_IDENTICAL_CALLS = 2
+# per-PATH read_file executions: paging a large file through offset/limit
+# chunks takes <= 6 reads at the default caps; beyond this the model is
+# re-reading ranges it already saw (observed: 10x/8x/7x on one file)
+MAX_PATH_READS = 8
+# per-RECORD edit_record executions: a validation repair spiral hammers the
+# same record (observed 12x on one record); later edits go to the NEXT run's
+# repair rounds instead of eating the step budget
+MAX_RECORD_EDITS = 5
 EMPTY_ABORT_THRESHOLD = 3
 # text-only replies (narration, or tool calls the gateway left as DSML text)
 # get nudged back to tools, but never forever - llm.py lifts DSML calls, and
@@ -97,10 +110,29 @@ GRACE_NOTE = ("STEP BUDGET EXHAUSTED - but records were written this session, "
               "so the verdict is missing. Call the finish tool NOW (verdict "
               "VULN_UPDATED with the files you wrote, NO_VULN, or ERROR). "
               "Every other tool is disabled; finish is the ONLY accepted call.")
+GRACE_NOTE_NOWRITE = ("STEP BUDGET EXHAUSTED and no records were written - "
+                      "this is your LAST round and every tool except finish "
+                      "is disabled. Call the finish tool NOW with your best "
+                      "verdict: NO_VULN if the commit introduces or fixes "
+                      "nothing security-relevant, or ERROR if you found "
+                      "something but could not record it. Do not explore "
+                      "further.")
 DUPLICATE_NOTE = ("duplicate call: this exact %s call was already executed "
                   "earlier in this session and its result is unchanged. Do "
                   "NOT repeat it - continue with a DIFFERENT action or call "
                   "the finish tool.")
+REREAD_NOTE = ("loop guard: this exact %s call already ran %d times this "
+               "session - its content will not change. Reason from what is "
+               "already in the conversation, take a DIFFERENT action, or "
+               "call the finish tool.")
+PATH_REPEAT_NOTE = ("loop guard: %s was already read %d times this session "
+                    "- re-reading it again will not add anything. Reason "
+                    "from the content already in the conversation, inspect "
+                    "a DIFFERENT file, or call the finish tool.")
+EDIT_REPEAT_NOTE = ("loop guard: %s was already edited %d times this session "
+                    "without settling. Stop editing it - call the finish "
+                    "tool; leftover mechanical problems go to the next "
+                    "repair round.")
 CUT_NOTE = ("arguments JSON is incomplete: your output was cut off at the "
             "model/gateway token limit before the JSON closed. The content "
             "is too long for ONE call - do NOT retry the same giant call. "
@@ -348,9 +380,15 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
     step = 0
     write_extensions = 0
     deadline_sent_at = None
-    # canonical (name, args) -> [tool_call_ids of its LAST execution]; a
-    # repeat is refused unless its previous result was compacted away since
+    # canonical (name, args) -> [tool_call_ids of EVERY execution]; repeats
+    # are refused - an exact duplicate while the old result is verbatim, and
+    # any call past MAX_IDENTICAL_CALLS executions even after compaction
+    # (one re-read of compacted-away content is legitimate, a third
+    # identical call is a spiral)
     seen_calls = {}
+    # (name, path) -> executions: per-path loop guards (read_file paging vs
+    # re-reading the same ranges; edit_record validation spirals)
+    path_calls = {}
     shrunk_ids = set()   # tool_call_ids shrunk by compact_history so far
     last_prompt_tokens = 0
     compact_stalled = False  # last pass freed nothing; wait for new messages
@@ -360,6 +398,7 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
     provider_limit = int(lim.get("provider_input_limit") or 0)
     finish_only = False   # grace mode: every tool except finish is refused
     grace_used = False
+    grace_nowrite_used = False
     reconsider_used = False
 
     def record(event):
@@ -373,7 +412,8 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
     def one_round():
         """A single model round-trip + tool execution. True = stop the loop."""
         nonlocal budget, write_extensions, deadline_sent_at, finish_only
-        nonlocal grace_used, step, empty_streak, text_streak, repairs_used
+        nonlocal grace_used, grace_nowrite_used, step, empty_streak, text_streak
+        nonlocal repairs_used
         nonlocal reconsider_used, last_prompt_tokens, compact_stalled
         nonlocal compact_threshold, provider_limit
         step += 1
@@ -587,7 +627,18 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                     except (TypeError, ValueError):
                         canonical = None
                 prev_ids = seen_calls.get(canonical) if canonical else None
-                if prev_ids and not shrunk_ids.intersection(prev_ids):
+                result = None
+                if prev_ids and len(prev_ids) >= MAX_IDENTICAL_CALLS:
+                    # third-plus identical execution: a spiral even if the
+                    # earlier results were compacted away (qwen3.6-noreason
+                    # walks re-read the same ranges 7-10x per file after
+                    # compaction re-armed the dedup hole)
+                    result = {"ok": False, "error":
+                              REREAD_NOTE % (name, len(prev_ids))}
+                    log("step %d/%d %s -> refused (identical call executed "
+                        "%dx already - loop guard)" % (step, budget, name,
+                                                       len(prev_ids)))
+                elif prev_ids and not shrunk_ids.intersection(prev_ids):
                     # exact repeat of an earlier call whose result is still
                     # verbatim in the context: refuse instead of burning
                     # another round on the same output (fernflower runs
@@ -598,9 +649,37 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                     log("step %d/%d %s -> refused (exact duplicate of an "
                         "earlier call)" % (step, budget, name))
                 else:
-                    if canonical:
-                        seen_calls[canonical] = [call["id"]]
-                    result = tools.execute(name, arguments)
+                    # per-path loop guards (only for calls that actually
+                    # EXECUTE - refusals above must not inflate the counters)
+                    guard_path = None
+                    guard_cap = 0
+                    if isinstance(arguments, dict):
+                        raw_path = arguments.get("path")
+                        if raw_path:
+                            guard_path = os.path.normpath(str(raw_path))
+                            if name == "read_file":
+                                guard_cap = MAX_PATH_READS
+                            elif name == "edit_record":
+                                guard_cap = MAX_RECORD_EDITS
+                    guard_key = (name, guard_path) if (guard_path
+                                                        and guard_cap) else None
+                    guard_count = path_calls.get(guard_key, 0) if guard_key \
+                        else 0
+                    if guard_key and guard_count >= guard_cap:
+                        note = (PATH_REPEAT_NOTE if name == "read_file"
+                                else EDIT_REPEAT_NOTE)
+                        result = {"ok": False, "error":
+                                  note % (guard_path, guard_count)}
+                        log("step %d/%d %s -> refused (%s executed %dx "
+                            "already - per-path loop guard)"
+                            % (step, budget, name, guard_path, guard_count))
+                    else:
+                        if canonical:
+                            seen_calls.setdefault(canonical, []).append(
+                                call["id"])
+                        if guard_key:
+                            path_calls[guard_key] = guard_count + 1
+                        result = tools.execute(name, arguments)
             log("step %d/%d %s -> %s" % (step, budget, name,
                                          "ok" if result.get("ok") else "refused"))
             if name == "write_record" and result.get("ok"):
@@ -685,11 +764,37 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
                 # repair round) - never report NO_VULN with dirty records on
                 # disk
                 verdict["verdict"] = "VULN_UPDATED"
+            if (finish_only and grace_nowrite_used
+                    and not tools.wrote_records
+                    and verdict["verdict"] == "VULN_UPDATED"):
+                # the salvage round's own instructions allow VULN_UPDATED
+                # only for records already on disk - the model claims
+                # findings it never wrote. Publish nothing; requeue honestly
+                # instead of an empty update
+                reason = ("model finished VULN_UPDATED at budget exhaustion "
+                          "without writing any records")
+                record({"type": "end", "verdict": "ERROR", "files": [],
+                        "reason": reason, "step": step})
+                one_round.result = _error(reason, usage, step)
+                return True
+            if finish_only and grace_nowrite_used:
+                # salvaged best-effort verdict from the exhaustion round -
+                # auditable downstream via the marker
+                verdict["salvaged"] = True
+                note = ("salvaged at step budget exhaustion (the model "
+                        "explored the whole budget without calling finish)")
+                verdict["reason"] = ((verdict.get("reason") or "").strip()
+                                     + ("; " if verdict.get("reason") else "")
+                                     + note)
             if (reconsider is not None and not reconsider_used
-                    and verdict["verdict"] == "NO_VULN"):
+                    and verdict["verdict"] == "NO_VULN"
+                    and not verdict.get("salvaged")):
                 # prior-run hint (--doc-hints): a previous run recorded this
                 # commit - offer its actual records for one reconsideration
                 # round instead of accepting the NO_VULN straight away
+                # (a SALVAGED no-records NO_VULN skips the hook: the session
+                # already proved it cannot conclude - do not hand it more
+                # budget to wander in)
                 reconsider_used = True
                 hint = reconsider()
                 if hint:
@@ -732,6 +837,20 @@ def run_agent(client, tools, system_prompt, first_user, max_steps, log,
             log("budget exhausted with records written - finish-grace round "
                 "(finish only)")
             user_message(GRACE_NOTE, "grace")
+            return False
+
+        # budget exhausted with NOTHING written: exploration-only sessions
+        # (the classic max_steps-without-finish failure) used to error out
+        # wholesale; grant ONE finish-only round so the model can still
+        # return its best verdict instead of requeueing the commit forever
+        if (step >= budget and not tools.wrote_records
+                and not grace_nowrite_used):
+            grace_nowrite_used = True
+            budget = step + 1
+            finish_only = True
+            log("budget exhausted without records - verdict-salvage round "
+                "(finish only)")
+            user_message(GRACE_NOTE_NOWRITE, "grace-nowrite")
             return False
 
         if step >= budget:

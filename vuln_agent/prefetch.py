@@ -98,7 +98,7 @@ def main(argv=None):
         base_url=triage["base_url"], api_key=triage["api_key"],
         model=triage["model"], timeout=llm["timeout"], retries=llm["retries"],
         temperature=llm["temperature"], max_tokens=llm["max_tokens"],
-        extra_body=llm["extra_body"],
+        extra_body=triage["extra_body"],
         heartbeat_seconds=llm["heartbeat_seconds"])
     cache_dir = os.path.join(args.verdicts_dir, "triage")
     if triage["base_url"] == llm["base_url"]:

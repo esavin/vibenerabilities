@@ -70,6 +70,9 @@ def parse_args(argv):
                         help="records root of the previous run, to read the "
                              "hint records from")
     parser.add_argument("--model", default="", help="override the configured model")
+    parser.add_argument("--fallback-model", default="",
+                        help="override the fallback model (one retry of "
+                             "behaviorally failed record sessions)")
     parser.add_argument("--max-steps", type=int, default=0,
                         help="override the max agent steps")
     return parser.parse_args(argv)
@@ -126,6 +129,18 @@ def repo_relative(path, records_root, records_root_rel):
     return (prefix + "/" + text) if prefix else text
 
 
+def behavioral_failure(reason):
+    """True for session failures caused by MODEL BEHAVIOR rather than the
+    pipeline: step-budget spirals, empty/text-only response streaks. These
+    are model-variant-specific (a noreason build loops on re-reads, a
+    reasoning build hides its output in reasoning) and worth one retry on a
+    DIFFERENT model; everything else (validation, inspect, LLM transport)
+    has its own recovery path."""
+    text = str(reason or "")
+    return any(marker in text for marker in (
+        "max_steps", "empty responses", "text-only responses"))
+
+
 def verdict_line(verdict, records_root, records_root_rel):
     if verdict["verdict"] == "VULN_UPDATED":
         files = ",".join(repo_relative(f, records_root, records_root_rel)
@@ -136,10 +151,17 @@ def verdict_line(verdict, records_root, records_root_rel):
         if verdict.get("triage"):
             return "VERDICT: NO_VULN(triage)"
         # classify-only NO_VULN carries an explicit confidence marker so a
-        # verdict replayer can refuse "uncertain" skips (recall before speed)
+        # verdict replayer can refuse "uncertain" skips (recall before
+        # speed). A SALVAGED no-records verdict (the model never called
+        # finish; the exhaustion round forced the best-effort answer) gets
+        # the same "uncertain" marker, so a future --reuse-verdicts rerun
+        # re-analyzes it instead of replaying it for free
         confidence = str(verdict.get("confidence") or "").strip()
         if confidence in ("confident", "uncertain"):
             return "VERDICT: NO_VULN %s" % confidence
+        if verdict.get("salvaged"):
+            return "VERDICT: NO_VULN uncertain (salvaged at step budget " \
+                   "exhaustion)"
         return "VERDICT: NO_VULN"
     reason = " ".join(str(verdict.get("reason") or "unspecified").split())[:200]
     return "VERDICT: ERROR %s" % reason
@@ -177,7 +199,8 @@ def main(argv=None):
     try:
         config = load_config(args.config)
         llm = resolve_llm(config, cli_model=args.model or None,
-                          cli_max_steps=args.max_steps or None)
+                          cli_max_steps=args.max_steps or None,
+                          cli_fallback=args.fallback_model or None)
         limits = resolve_limits(config)
         squash_cfg = resolve_squash(config, limits)
         triage = resolve_triage(config, llm)
@@ -353,17 +376,25 @@ def main(argv=None):
         stale_by_record = (plan or {}).get("stale_by_record") or {}
         if root_commit and llm["max_steps_initial"] > 0:
             max_steps = llm["max_steps_initial"]
-        elif changed and not batches and not (
-                plan and (plan["prepass_edited"] or plan["stale_by_record"])):
-            # record-heavy commits (big moves touching many cited records)
-            # need more tool rounds: +1 step per 8 changed files, capped at
-            # max_steps_cap. NOT applied when path hygiene ran (pre-pass or
-            # a batched worklist): the repair workload is handled by its own
-            # mechanical pass / batch sessions, and a giant changed-file
-            # count then only buys the classification session room to
-            # wander.
-            boost = min(max(0, llm["max_steps_cap"] - max_steps), changed // 8)
-            max_steps += boost
+        elif changed:
+            if batches or (plan and (plan["prepass_edited"]
+                                     or plan["stale_by_record"])):
+                # path hygiene runs its own repair sessions, but a GIANT
+                # commit still has to be classified against its full diff:
+                # measured (coddy-agent 7a5e10ab, 150 files) the zero boost
+                # starved the main session into max_steps ERROR. Half boost,
+                # only from a clearly-large commit (>= 32 changed files).
+                if changed >= 32:
+                    boost = min(max(0, llm["max_steps_cap"] - max_steps),
+                                max(1, changed // 16))
+                    max_steps += boost
+            else:
+                # record-heavy commits (big moves touching many cited records)
+                # need more tool rounds: +1 step per 8 changed files, capped at
+                # max_steps_cap.
+                boost = min(max(0, llm["max_steps_cap"] - max_steps),
+                            changed // 8)
+                max_steps += boost
         # classify-only sessions get a hard step budget: a NO_VULN
         # classification is a pure function of the commit, so a session that
         # cannot conclude within classify_max_steps steps was wandering - its
@@ -433,13 +464,14 @@ def main(argv=None):
             triage_client = client
             if (triage["model"] != llm["model"]
                     or triage["base_url"] != llm["base_url"]
-                    or triage["api_key"] != llm["api_key"]):
+                    or triage["api_key"] != llm["api_key"]
+                    or triage["extra_body"] != llm["extra_body"]):
                 triage_client = ChatClient(
                     base_url=triage["base_url"], api_key=triage["api_key"],
                     model=triage["model"], timeout=llm["timeout"],
                     retries=llm["retries"], temperature=llm["temperature"],
                     max_tokens=llm["max_tokens"],
-                    extra_body=llm["extra_body"],
+                    extra_body=triage["extra_body"],
                     heartbeat_seconds=llm["heartbeat_seconds"])
             # a triage model on a DIFFERENT endpoint must not learn/overwrite
             # the main model's provider window (the shared file would ping-pong
@@ -514,6 +546,59 @@ def main(argv=None):
                                     transcript=transcript, reconsider=reconsider,
                                     limits=limits,
                                     limit_state_path=limit_state_path)
+                # fallback-model retry for BEHAVIORAL session failures
+                # (max_steps spirals, empty/text-only responses): different
+                # model variants fail differently (a noreason build loops on
+                # re-reads, a reasoning build returns empty content), so one
+                # retry on the configured llm.fallback_model recovers
+                # commits the primary model fails on REPEATEDLY (measured:
+                # 0c51d214/74aa8a69/7a5e10ab failed in two consecutive
+                # walks). Record sessions only - classify/squash ERRORs
+                # already replay safely through the outer loop.
+                fallback_model = llm.get("fallback_model") or ""
+                if (verdict.get("verdict") == "ERROR" and mode == "record"
+                        and fallback_model
+                        and fallback_model != llm["model"]
+                        and behavioral_failure(verdict.get("reason") or "")):
+                    log("session failed behaviorally (%s) - ONE retry with "
+                        "fallback model %s" % (verdict.get("reason"),
+                                               fallback_model))
+                    fallback_client = ChatClient(
+                        base_url=llm["base_url"], api_key=llm["api_key"],
+                        model=fallback_model, timeout=llm["timeout"],
+                        retries=llm["retries"],
+                        temperature=llm["temperature"],
+                        max_tokens=llm["max_tokens"],
+                        extra_body=llm["extra_body"],
+                        heartbeat_seconds=llm["heartbeat_seconds"])
+                    retry_tools = ToolSet(worktree, records_root,
+                                          classify_only=classify_only,
+                                          limits=limits)
+                    # the failed session may have left records on disk
+                    # (validation-ERROR cases) - rebuild the first message
+                    # so the retry sees the CURRENT records map
+                    retry_first_user, _info = build_first_user(
+                        args.sha, worktree, records_root, mode, today,
+                        read_conventions(records_root, limits), limits=limits)
+                    record_session({"model": fallback_model,
+                                    "fallback_model": fallback_model,
+                                    "first_user_chars": len(retry_first_user)})
+                    retry_verdict = run_agent(
+                        fallback_client, retry_tools, sys_prompt,
+                        retry_first_user, max_steps, log,
+                        validator=validator, repair_rounds=val_rounds,
+                        transcript=transcript, reconsider=reconsider,
+                        limits=limits, limit_state_path=limit_state_path)
+                    if retry_verdict.get("verdict") != "ERROR":
+                        retry_verdict["fallback_model"] = fallback_model
+                        verdict = retry_verdict
+                        tools = retry_tools
+                        log("fallback model %s recovered the session: %s"
+                            % (fallback_model, retry_verdict["verdict"]))
+                    else:
+                        log("fallback model %s failed too (%s) - keeping the "
+                            "original ERROR" % (fallback_model,
+                                                retry_verdict.get("reason")))
                 session_verdicts.append(verdict)
                 wrote_records = wrote_records or tools.wrote_records
             except FatalLLMError as exc:
@@ -557,7 +642,7 @@ def main(argv=None):
             # carry the deciding session's classify confidence / triage-skip
             # marker into the commit verdict - verdict_line (and run.sh's
             # replay gate behind it) key off them
-            for _key in ("confidence", "triage"):
+            for _key in ("confidence", "triage", "salvaged"):
                 if _key in session_verdicts[-1]:
                     verdict[_key] = session_verdicts[-1][_key]
         if failed:
